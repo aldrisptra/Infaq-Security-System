@@ -1,7 +1,7 @@
 export default function InfaqHeader() {
   return (
-    <header className="w-full bg-gradient-to-b from-emerald-2000 to-emerald-400/60 border-b border-emerald-400/70">
-      <div className="mx-auto max-w-6xl px-4 sm:px-6 py-4 flex items-center justify-center">
+    <header className="w-full bg-gradient-to-b from-emerald-50 to-emerald-200 border-b border-emerald-200">
+      <div className="mx-auto max-w-4xl px-4 sm:px-6 py-4 flex items-center justify-center">
         {/* Left: Logo + Title */}
         <div className="flex items-center gap-3">
           {/* Logo mark */}

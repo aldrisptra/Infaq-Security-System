@@ -1,6 +1,6 @@
 export default function StatusCard({ active, onToggle }) {
   return (
-    <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4 mx-4 sm:mx-8 lg:mx-16">
+  <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span

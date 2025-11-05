@@ -75,6 +75,20 @@ def send_telegram(text: str):
     except Exception as e:
         print("[TG] gagal kirim pesan:", e)
 
+
+def send_telegram_photo(jpg_bytes: bytes, caption: str = ""):
+    """Send a photo (JPEG bytes) to Telegram chat with an optional caption."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+        files = {"photo": ("capture.jpg", jpg_bytes, "image/jpeg")}
+        data = {"chat_id": TG_CHAT_ID, "caption": caption}
+        # increased timeout for uploads
+        httpx.post(url, data=data, files=files, timeout=20.0)
+    except Exception as e:
+        print("[TG] gagal kirim foto:", e)
+
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -248,18 +262,49 @@ def capture_loop(cam_index=0):
         if roi_rect:
             cv2.rectangle(frame, (roi_rect[0], roi_rect[1]), (roi_rect[2], roi_rect[3]), (255, 165, 0), 2)
 
+        # choose border color based on status
         color = (0, 255, 255) if status == "NORMAL" else ((0, 165, 255) if status == "WARN" else (0, 0, 255))
         H, W = frame.shape[:2]
-        cv2.rectangle(frame, (0, 0), (W, 44), (0, 0, 0), -1)
+
+        # prepare HUD text and compute a button-like rectangle in bottom-left
         hud = f"Status: {status} | absent≈{avg_absent:.2f} | dets={len(dets)}"
-        cv2.putText(frame, hud, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.6
+        thickness = 2
+        (text_w, text_h), baseline = cv2.getTextSize(hud, font, scale, thickness)
+
+        pad_x = 12
+        pad_y = 8
+        # initial rectangle coordinates (10px margin from left and bottom)
+        x1 = 10
+        y2 = H - 10
+        x2 = x1 + text_w + pad_x * 2
+        y1 = y2 - (text_h + pad_y * 2)
+
+        # ensure rectangle stays within frame bounds
+        if x2 > W - 10:
+            x2 = W - 10
+            x1 = max(10, x2 - (text_w + pad_x * 2))
+
+        x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+
+        # background filled rectangle (button look)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        # colored border to indicate status
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        # text baseline position: bottom-left inside the padded rectangle
+        text_x = x1 + pad_x
+        text_y = y2 - pad_y - baseline
+        # use white text for readability
+        cv2.putText(frame, hud, (text_x, text_y + text_h - baseline), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
         # Telegram saat naik ALERT (dengan cooldown)
         if TG_TOKEN and TG_CHAT_ID and status == "ALERT" and last_status != "ALERT":
             now = time.time()
             if now - last_alert_ts > TG_COOLDOWN_S:
                 last_alert_ts = now
-                send_telegram("⚠️ Kotak infaq tidak terdeteksi di kamera! (status=ALERT)")
+                send_telegram("⚠️ Kotak infaq tidak terdeteksi di kamera ces!")
 
         last_status = status
 

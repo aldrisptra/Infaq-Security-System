@@ -1,6 +1,4 @@
-/* src/index.css */
-@tailwind utilities;
-@reference "tailwindcss";
+@import "tailwindcss";
 
 /* Komponen reusable (opsional) */
 @layer components {

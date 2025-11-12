@@ -21,3 +21,11 @@ desktop.ini
 # OS junk
 .DS_Store
 Thumbs.db
+
+.venv/
+__pycache__/
+datasets/
+runs/
+models/**/*.pt
+models/**/*.onnx
+*.cache

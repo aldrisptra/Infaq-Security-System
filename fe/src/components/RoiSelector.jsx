@@ -1,33 +1,51 @@
-// src/components/RoiSelector.jsx
 import React, { useEffect, useRef, useState } from "react";
 
-export default function RoiSelector({ streamUrl }) {
+/**
+ * streamUrl: URL MJPEG
+ * apiBase:   http://host:port untuk REST (snapshot & ROI)
+ */
+export default function RoiSelector({ streamUrl, apiBase }) {
   const containerRef = useRef(null);
-  const [roi, setRoi] = useState(null); // {x,y,w,h} relatif 0..1
-  const [dragging, setDragging] = useState(false);
-  const [start, setStart] = useState(null); // {x,y} relatif 0..1
-  const [tempRect, setTempRect] = useState(null); // rect sementara saat drag
 
-  // Ambil ROI yang tersimpan
+  const [roi, setRoi] = useState(null); // {x,y,w,h} relatif
+  const [dragging, setDragging] = useState(false);
+  const [start, setStart] = useState(null); // {x,y}
+  const [tempRect, setTempRect] = useState(null);
+  const [imgErr, setImgErr] = useState(false);
+  const [altSrc, setAltSrc] = useState(null);
+
+  // Ambil ROI tersimpan
   useEffect(() => {
     (async () => {
       try {
-        const r = await fetch("/roi");
+        const r = await fetch(`${apiBase}/roi`);
         const data = await r.json();
         if (data?.roi) setRoi(data.roi);
       } catch (e) {
-        console.error("Gagal GET /roi", e);
+        console.warn("GET /roi gagal", e);
       }
     })();
-  }, []);
+  }, [apiBase]);
 
-  // hitung posisi relatif 0..1 dari event mouse
+  // Fallback snapshot polling jika MJPEG gagal
+  useEffect(() => {
+    let timer;
+    const tick = () => {
+      const u = `${apiBase}/camera/snapshot?ts=${Date.now()}`;
+      setAltSrc(u);
+      timer = setTimeout(tick, 300);
+    };
+    if (imgErr) tick();
+    return () => timer && clearTimeout(timer);
+  }, [imgErr, apiBase]);
+
+  // Hitung posisi relatif 0..1
   const relPos = (e) => {
     const rect = containerRef.current.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
     const y = (e.clientY - rect.top) / rect.height;
-    // clamp 0..1
     return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
+    // clamp 0..1
   };
 
   const onMouseDown = (e) => {
@@ -60,93 +78,117 @@ export default function RoiSelector({ streamUrl }) {
   const saveROI = async () => {
     if (!roi) return;
     const payload = {
-      x: Number(roi.x.toFixed(6)),
-      y: Number(roi.y.toFixed(6)),
-      w: Number(roi.w.toFixed(6)),
-      h: Number(roi.h.toFixed(6)),
+      x: +roi.x.toFixed(6),
+      y: +roi.y.toFixed(6),
+      w: +roi.w.toFixed(6),
+      h: +roi.h.toFixed(6),
     };
-    const r = await fetch("/roi", {
+    const r = await fetch(`${apiBase}/roi`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (!r.ok) {
-      const msg = await r.text();
-      alert("Gagal menyimpan ROI: " + msg);
-      return;
-    }
+    if (!r.ok) return alert("Gagal menyimpan ROI: " + (await r.text()));
     alert("ROI tersimpan!");
   };
 
   const clearROI = async () => {
-    await fetch("/roi", { method: "DELETE" });
+    await fetch(`${apiBase}/roi`, { method: "DELETE" });
     setRoi(null);
   };
 
-  // Helper: style div overlay dari ROI relatif (pakai persen)
   const styleFromROI = (r) => ({
+    position: "absolute",
     left: `${r.x * 100}%`,
     top: `${r.y * 100}%`,
     width: `${r.w * 100}%`,
     height: `${r.h * 100}%`,
+    border: "2px solid rgba(34,197,94,0.9)",
+    background: "rgba(34,197,94,0.1)",
+    borderRadius: 6,
+    pointerEvents: "none",
   });
 
   return (
-    <div className="w-full">
+    <div>
       <div
         ref={containerRef}
-        className="relative w-full max-w-3xl mx-auto select-none"
-        onMouseDown={onMouseDown}
-        onMouseMove={onMouseMove}
-        onMouseUp={onMouseUp}
+        style={{
+          position: "relative",
+          width: "100%",
+          maxWidth: 900,
+          margin: "0 auto",
+          userSelect: "none",
+        }}
       >
-        {/* Stream kamera */}
+        {/* Stream */}
         <img
-          src={streamUrl}
+          src={altSrc || streamUrl}
           alt="camera"
-          className="w-full block"
+          style={{ width: "100%", display: "block" }}
           draggable={false}
+          onError={() => setImgErr(true)}
+          onLoad={() => setImgErr(false)}
         />
 
-        {/* Area interaktif transparan untuk drag */}
-        <div className="absolute inset-0 cursor-crosshair" />
+        {/* Layer untuk drag */}
+        <div
+          onMouseDown={onMouseDown}
+          onMouseMove={onMouseMove}
+          onMouseUp={onMouseUp}
+          style={{ position: "absolute", inset: 0, cursor: "crosshair" }}
+        />
 
-        {/* ROI persist (garis hijau) */}
-        {roi && (
-          <div
-            className="absolute border-2 border-green-500/90 bg-green-500/10 rounded"
-            style={styleFromROI(roi)}
-          />
-        )}
+        {/* ROI tersimpan */}
+        {roi && <div style={styleFromROI(roi)} />}
 
-        {/* Rect sementara saat drag (garis biru) */}
+        {/* ROI sementara (biru) */}
         {tempRect && (
           <div
-            className="absolute border-2 border-blue-500/90 bg-blue-500/10 rounded pointer-events-none"
-            style={styleFromROI(tempRect)}
+            style={{
+              position: "absolute",
+              left: `${tempRect.x * 100}%`,
+              top: `${tempRect.y * 100}%`,
+              width: `${tempRect.w * 100}%`,
+              height: `${tempRect.h * 100}%`,
+              border: "2px solid rgba(59,130,246,0.9)",
+              background: "rgba(59,130,246,0.1)",
+              borderRadius: 6,
+              pointerEvents: "none",
+            }}
           />
         )}
       </div>
 
-      <div className="mt-3 flex gap-2 justify-center">
+      {imgErr && (
+        <p style={{ textAlign: "center", color: "#b45309", marginTop: 8 }}>
+          MJPEG gagal dimuat, menampilkan snapshot (fallback).
+        </p>
+      )}
+
+      <div
+        style={{
+          marginTop: 12,
+          display: "flex",
+          gap: 8,
+          justifyContent: "center",
+        }}
+      >
         <button
           onClick={saveROI}
-          className="px-4 py-2 rounded-xl bg-emerald-600 text-white hover:opacity-90"
           disabled={!roi}
+          style={{ padding: "8px 14px" }}
         >
           Simpan ROI
         </button>
-        <button
-          onClick={clearROI}
-          className="px-4 py-2 rounded-xl bg-gray-200 hover:bg-gray-300"
-        >
+        <button onClick={clearROI} style={{ padding: "8px 14px" }}>
           Hapus ROI
         </button>
       </div>
 
-      <p className="text-sm text-gray-500 mt-2 text-center">
-        Tips: Drag di atas video untuk memilih area kotak infaq. Klik “Simpan
-        ROI”.
+      <p style={{ textAlign: "center", color: "#6b7280", marginTop: 8 }}>
+        Tips: drag di atas video untuk memilih area kotak infaq, lalu klik
+        “Simpan ROI”.
       </p>
     </div>
   );

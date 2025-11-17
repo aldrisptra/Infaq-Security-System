@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 
@@ -30,6 +30,12 @@ cap: Optional[cv2.VideoCapture] = None
 running = False
 latest_jpeg: Optional[bytes] = None
 lock = threading.Lock()
+
+# info sumber saat ini
+CUR_SOURCE = "webcam"         # "webcam" | "video"
+CUR_INDEX  = 0                # index untuk webcam
+CUR_PATH   = None             # path file video
+CUR_LOOP   = False            # loop bila source=video
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -108,9 +114,7 @@ YOLO_WEIGHTS    = os.getenv("YOLO_WEIGHTS", str(DEFAULT_WEIGHT))
 YOLO_CONF_DEF   = float(os.getenv("YOLO_CONF", "0.25"))
 YOLO_IOU_DEF    = float(os.getenv("YOLO_IOU", "0.60"))
 YOLO_IMG_DEF    = int(os.getenv("YOLO_IMG",  "800"))
-# NOTE: bikin lebih permisif dulu (0.001). Kamu boleh naikkan lagi nanti.
 MIN_AREA_RATIO  = float(os.getenv("MIN_AREA_RATIO", "0.001"))
-
 INFER_EVERY     = int(os.getenv("INFER_EVERY", "1"))
 
 CAM_BACKEND     = os.getenv("CAM_BACKEND", "DSHOW").upper()
@@ -124,24 +128,22 @@ CENTER_IN_ROI = int(os.getenv("CENTER_IN_ROI", "1")) == 1
 ROI_STRATEGY  = os.getenv("ROI_STRATEGY", "crop").lower()  # 'crop' | 'filter'
 REQUIRE_ROI   = int(os.getenv("REQUIRE_ROI", "0")) == 1
 
-# Default: kosong → TIDAK memfilter nama label (biar aman dulu)
 TARGET_LABELS = {
     s.strip().lower()
     for s in os.getenv("TARGET_LABELS", "").split(",")
     if s.strip()
 }
 
-# Debug
-DEBUG_LOG  = int(os.getenv("DEBUG_LOG", "1")) == 1  # log ringkas
+DEBUG_LOG  = int(os.getenv("DEBUG_LOG", "1")) == 1
 def _matches_target(cls_id: int, label: str) -> bool:
     label_l = (label or "").lower()
     if TARGET_CLASS_IDS:
         return cls_id in TARGET_CLASS_IDS
     if TARGET_LABELS:
         return label_l in TARGET_LABELS
-    return True  # kalau keduanya kosong → terima semua
+    return True
 
-# ========= Telegram (pakai ENV) =========
+# ========= Telegram via ENV (tanpa default bocor) =========
 TG_TOKEN      = os.getenv("TG_TOKEN", "7697921487:AAEvZXLkC61Nzx-eh1e2BES1VfqSJ3wN32E")
 TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "1215968232")
 TG_COOLDOWN_S = int(os.getenv("TG_COOLDOWN", "10"))
@@ -182,10 +184,6 @@ def _ensure_model(weights_path: str, conf: float, iou: float, imgsz: int):
     print("[YOLO] loaded:", weights_path, "| conf=", conf, "iou=", iou, "img=", imgsz)
 
 def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
-    """
-    Kembalikan HANYA deteksi target di dalam ROI.
-    Tambahan DEBUG_LOG menampilkan ringkasan drop (label/area/center).
-    """
     if _yolo_model is None:
         return
     if counter % INFER_EVERY != 0:
@@ -222,12 +220,10 @@ def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
             x1, y1, x2, y2 = [int(v) for v in b.xyxy[0]]
             cls_id = int(b.cls[0]) if hasattr(b, "cls") and b.cls is not None else -1
 
-            # Map kembali ke koordinat frame kalau infer di crop
             if use_crop:
                 x1 += rx1; x2 += rx1
                 y1 += ry1; y2 += ry1
 
-            # Label string dari model
             if isinstance(_model_names, dict):
                 label = _model_names.get(cls_id, "obj")
             elif isinstance(_model_names, (list, tuple)) and 0 <= cls_id < len(_model_names):
@@ -235,18 +231,15 @@ def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
             else:
                 label = "obj"
 
-            # Filter kelas target
             if not _matches_target(cls_id, label):
                 drop_label += 1
                 continue
 
-            # Filter area relatif
             area = max(1, (x2 - x1) * (y2 - y1))
             if (area / base_area) < min_area_ratio:
                 drop_area += 1
                 continue
 
-            # Wajib pusat bbox berada di ROI?
             if roi_rect and CENTER_IN_ROI:
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
@@ -256,7 +249,6 @@ def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
 
             dets_target.append((x1, y1, x2, y2, conf_b, cls_id, label))
 
-    # Gambar hanya deteksi target
     for (x1, y1, x2, y2, conf_b, cls_id, label) in dets_target[:50]:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 0), 2)
         cv2.putText(frame, f"{label} {conf_b:.2f}", (x1, max(12, y1 - 6)),
@@ -267,8 +259,22 @@ def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
 
     return dets_target
 
+# ========= Util sumber video =========
+def _open_source(source: str, index: int, path: Optional[str]) -> cv2.VideoCapture:
+    """Buka VideoCapture untuk webcam atau file."""
+    if source == "webcam":
+        backend = CAP_MAP.get(CAM_BACKEND, cv2.CAP_ANY)
+        cap0 = cv2.VideoCapture(index, backend)
+        if not cap0.isOpened() and backend != cv2.CAP_ANY:
+            cap0 = cv2.VideoCapture(index, cv2.CAP_ANY)
+        return cap0
+    else:
+        if not path:
+            raise ValueError("path video kosong")
+        return cv2.VideoCapture(path)
+
 # ========= Capture loop =========
-def capture_loop(cam_index=0):
+def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=False):
     global cap, running, latest_jpeg
 
     try:
@@ -278,17 +284,16 @@ def capture_loop(cam_index=0):
         running = False
         return
 
-    backend = CAP_MAP.get(CAM_BACKEND, cv2.CAP_ANY)
-    cap = cv2.VideoCapture(cam_index, backend)
-    if not cap.isOpened() and backend != cv2.CAP_ANY:
-        cap = cv2.VideoCapture(cam_index, cv2.CAP_ANY)
+    cap = _open_source(source, index, path)
     if not cap.isOpened():
-        print(f"[CAM] gagal membuka kamera index {cam_index}")
+        print(f"[CAM] gagal membuka sumber: {source} | index={index} | path={path}")
         running = False
         return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    # set resolusi untuk webcam (tidak berpengaruh ke file)
+    if source == "webcam":
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     absent_hist = []
     missing_streak = 0
@@ -296,7 +301,6 @@ def capture_loop(cam_index=0):
     last_alert_ts = 0.0
     counter = 0
 
-    # ROI init + auto-reload saat file berubah
     roi_rect = None
     roi_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
     ok_first, frame0 = cap.read()
@@ -305,12 +309,22 @@ def capture_loop(cam_index=0):
         if rr:
             roi_rect = rr
             print("[ROI] aktif:", roi_rect)
+    else:
+        print("[CAM] frame pertama gagal")
+        running = False
+        cap.release()
+        return
 
     while running:
         ok, frame = cap.read()
         if not ok:
+            # EOF video file → loop atau berhenti
+            if source == "video" and loop_video:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
             time.sleep(0.02)
             continue
+
         counter += 1
 
         # cek perubahan ROI tiap ~30 frame
@@ -337,11 +351,9 @@ def capture_loop(cam_index=0):
             print("[YOLO] inference error:", e)
             dets = []
 
-        # (opsional) tanpa ROI dianggap "hilang"
         if REQUIRE_ROI and (roi_rect is None):
             dets = []
 
-        # absent logic
         present_raw = len(dets) > 0
         if present_raw:
             missing_streak = 0
@@ -354,14 +366,12 @@ def capture_loop(cam_index=0):
             absent_hist.pop(0)
         avg_absent = float(np.mean(absent_hist)) if absent_hist else (0.0 if present else 1.0)
 
-        # status
         status = "NORMAL"
         if avg_absent >= ALERT_THRESHOLD:
             status = "ALERT"
         elif avg_absent >= WARN_THRESHOLD:
             status = "WARN"
 
-        # draw ROI + HUD
         if roi_rect:
             cv2.rectangle(frame, (roi_rect[0], roi_rect[1]), (roi_rect[2], roi_rect[3]), (255, 165, 0), 2)
 
@@ -380,7 +390,6 @@ def capture_loop(cam_index=0):
         text_x = x1 + pad_x; text_y = y2 - pad_y - baseline
         cv2.putText(frame, hud, (text_x, text_y + text_h - baseline), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
-        # Telegram saat ALERT (cooldown)
         if TG_TOKEN and TG_CHAT_ID and status == "ALERT" and last_status != "ALERT":
             now = time.time()
             if now - last_alert_ts > TG_COOLDOWN_S:
@@ -389,7 +398,6 @@ def capture_loop(cam_index=0):
 
         last_status = status
 
-        # encode JPEG
         ok2, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         if ok2:
             with lock:
@@ -416,6 +424,10 @@ def mjpeg_gen():
 def status():
     return {
         "running": running,
+        "source": CUR_SOURCE,
+        "index": CUR_INDEX,
+        "path": CUR_PATH,
+        "loop": CUR_LOOP,
         "weights": YOLO_WEIGHTS,
         "conf": YOLO_CONF_DEF,
         "iou": YOLO_IOU_DEF,
@@ -425,13 +437,23 @@ def status():
     }
 
 @app.post("/camera/start")
-def start(index: int = 0):
-    global running
+def start(
+    source: str = Query("webcam", pattern="^(webcam|video)$"),
+    index: int = 0,
+    path: Optional[str] = None,
+    loop: bool = True,
+):
+    global running, CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP
     if running:
         return {"ok": True, "msg": "already running"}
+    CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP = source, index, path, loop
     running = True
-    threading.Thread(target=capture_loop, kwargs={"cam_index": index}, daemon=True).start()
-    return {"ok": True}
+    threading.Thread(
+        target=capture_loop,
+        kwargs={"source": source, "index": index, "path": path, "loop_video": loop},
+        daemon=True
+    ).start()
+    return {"ok": True, "source": source, "index": index, "path": path, "loop": loop}
 
 @app.post("/camera/stop")
 def stop():

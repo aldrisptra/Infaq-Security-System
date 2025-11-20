@@ -4,4 +4,4 @@ train: images/train
 val: images/val
 
 nc: 1
-names: [kotak_infaq]  # nama kelas tunggal
+names: [kotak_infaq]

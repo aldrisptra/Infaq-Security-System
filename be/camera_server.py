@@ -13,7 +13,7 @@ from pydantic import BaseModel, confloat
 from ultralytics import YOLO
 import httpx
 
-# ========= FastAPI (satu kali saja) =========
+# ========= FastAPI  =========
 app = FastAPI(docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
 app.add_middleware(
     CORSMiddleware,
@@ -31,15 +31,19 @@ running = False
 latest_jpeg: Optional[bytes] = None
 lock = threading.Lock()
 
+# state alert
+alert_status = "present"  # "present" | "missing"
+last_alert_photo_ts = 0.0
+
 # info sumber saat ini
-CUR_SOURCE = "webcam"         # "webcam" | "video"
-CUR_INDEX  = 0                # index untuk webcam
-CUR_PATH   = None             # path file video
-CUR_LOOP   = False            # loop bila source=video
+CUR_SOURCE = "webcam"         
+CUR_INDEX  = 0                
+CUR_PATH   = None          
+CUR_LOOP   = False           
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# ========= ROI (relatif 0..1, disimpan di roi_config.json) =========
+# ========= ROI  =========
 class ROI(BaseModel):
     x: confloat(ge=0.0, le=1.0)
     y: confloat(ge=0.0, le=1.0)
@@ -143,7 +147,7 @@ def _matches_target(cls_id: int, label: str) -> bool:
         return label_l in TARGET_LABELS
     return True
 
-# ========= Telegram via ENV (tanpa default bocor) =========
+# ========= Telegram via ENV  =========
 TG_TOKEN      = os.getenv("TG_TOKEN", "7697921487:AAEvZXLkC61Nzx-eh1e2BES1VfqSJ3wN32E")
 TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "1215968232")
 TG_COOLDOWN_S = int(os.getenv("TG_COOLDOWN", "10"))
@@ -168,7 +172,7 @@ def send_telegram_photo(jpg_bytes: bytes, caption: str = ""):
     except Exception as e:
         print("[TG] gagal kirim foto:", e)
 
-# ========= YOLO (lazy load) =========
+# ========= YOLO  =========
 _yolo_model = None
 _model_names = None
 
@@ -275,7 +279,7 @@ def _open_source(source: str, index: int, path: Optional[str]) -> cv2.VideoCaptu
 
 # ========= Capture loop =========
 def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=False):
-    global cap, running, latest_jpeg
+    global cap, running, latest_jpeg, alert_status, last_alert_photo_ts
 
     try:
         _ensure_model(YOLO_WEIGHTS, YOLO_CONF_DEF, YOLO_IOU_DEF, YOLO_IMG_DEF)
@@ -290,7 +294,7 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
         running = False
         return
 
-    # set resolusi untuk webcam (tidak berpengaruh ke file)
+    # set resolusi untuk webcam 
     if source == "webcam":
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -318,16 +322,16 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
     while running:
         ok, frame = cap.read()
         if not ok:
-            # EOF video file → loop atau berhenti
+       
             if source == "video" and loop_video:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
             time.sleep(0.02)
             continue
+        
 
         counter += 1
 
-        # cek perubahan ROI tiap ~30 frame
         if counter % 30 == 0:
             new_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
             if new_mtime != roi_mtime:
@@ -336,7 +340,6 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
                 roi_rect = rr
                 print("[ROI] reload:", roi_rect)
 
-        # infer + draw
         try:
             dets = _infer_and_draw(
                 frame=frame,
@@ -371,10 +374,34 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
             status = "ALERT"
         elif avg_absent >= WARN_THRESHOLD:
             status = "WARN"
+        status = "NORMAL"
+        if avg_absent >= ALERT_THRESHOLD:
+            status = "ALERT"
+        elif avg_absent >= WARN_THRESHOLD:
+            status = "WARN"
 
+        # Update alert status
+        old_alert = alert_status
+        if status == "ALERT":
+            alert_status = "missing"
+        else:
+            alert_status = "present"
+
+        # Kirim foto ke Telegram saat ALERT pertama kali
+        if TG_TOKEN and TG_CHAT_ID and status == "ALERT" and old_alert != "missing":
+            now = time.time()
+            if now - last_alert_photo_ts > TG_COOLDOWN_S:
+                last_alert_photo_ts = now
+                
+                # Encode frame ke JPG untuk dikirim
+                ok_jpg, jpg_buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                if ok_jpg:
+                    jpg_bytes = jpg_buf.tobytes()
+                    send_telegram_photo(jpg_bytes, "⚠️ ALERT: Kotak infaq tidak terdeteksi!")
+
+        # Gambar ROI rectangle
         if roi_rect:
             cv2.rectangle(frame, (roi_rect[0], roi_rect[1]), (roi_rect[2], roi_rect[3]), (255, 165, 0), 2)
-
         color = (0, 255, 255) if status == "NORMAL" else ((0, 165, 255) if status == "WARN" else (0, 0, 255))
         H, W = frame.shape[:2]
         hud = f"Status: {status} | absent≈{avg_absent:.2f} | dets={len(dets)}"
@@ -390,12 +417,6 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
         text_x = x1 + pad_x; text_y = y2 - pad_y - baseline
         cv2.putText(frame, hud, (text_x, text_y + text_h - baseline), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
-        if TG_TOKEN and TG_CHAT_ID and status == "ALERT" and last_status != "ALERT":
-            now = time.time()
-            if now - last_alert_ts > TG_COOLDOWN_S:
-                last_alert_ts = now
-                send_telegram("⚠️ Kotak infaq tidak terdeteksi di kamera!")
-
         last_status = status
 
         ok2, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
@@ -407,6 +428,7 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
 
     if cap:
         cap.release()
+        
 
 # ========= MJPEG generator =========
 def mjpeg_gen():
@@ -424,6 +446,7 @@ def mjpeg_gen():
 def status():
     return {
         "running": running,
+        "alert_status": alert_status, 
         "source": CUR_SOURCE,
         "index": CUR_INDEX,
         "path": CUR_PATH,

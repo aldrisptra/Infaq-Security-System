@@ -27,7 +27,7 @@ export default function CameraSection() {
           message:
             alert_status === "missing"
               ? "⚠️ Kotak infaq tidak terdeteksi!"
-              : "✓ Kotak infaq kembali terdeteksi",
+              : "✓ Kotak infaq terdeteksi",
         };
 
         setHistory((prev) => [newEvent, ...prev].slice(0, 10)); // Simpan max 10 riwayat
@@ -97,10 +97,10 @@ export default function CameraSection() {
   };
 
   return (
-    <div className="min-h-screen bg-teal-500">
+    <div className="min-h-screen bg-emerald-900">
       <div className="max-w-7xl mx-auto">
         {/* Status Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 py-6 px-4 sm:px-7">
           {/* Camera Status Card */}
           <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-blue-500">
             <div className="flex items-center justify-between">
@@ -110,7 +110,7 @@ export default function CameraSection() {
                 </p>
                 <p
                   className={`text-2xl font-bold mt-1 ${
-                    active ? "text-green-600" : "text-gray-400"
+                    active ? "text-emerald-700" : "text-gray-400"
                   }`}
                 >
                   {active ? "Aktif" : "Nonaktif"}
@@ -118,12 +118,12 @@ export default function CameraSection() {
               </div>
               <div
                 className={`p-3 rounded-full ${
-                  active ? "bg-green-100" : "bg-gray-100"
+                  active ? "bg-emerald-100" : "bg-gray-100"
                 }`}
               >
                 <svg
                   className={`w-8 h-8 ${
-                    active ? "text-green-600" : "text-gray-400"
+                    active ? "text-emerald-700" : "text-gray-400"
                   }`}
                   fill="none"
                   stroke="currentColor"
@@ -143,7 +143,9 @@ export default function CameraSection() {
           {/* Box Status Card */}
           <div
             className={`bg-white rounded-xl shadow-lg p-6 border-l-4 ${
-              alertStatus === "missing" ? "border-red-500" : "border-green-500"
+              alertStatus === "missing"
+                ? "border-red-500"
+                : "border-emerald-700"
             }`}
           >
             <div className="flex items-center justify-between">
@@ -155,7 +157,7 @@ export default function CameraSection() {
                   className={`text-2xl font-bold mt-1 ${
                     alertStatus === "missing"
                       ? "text-red-600"
-                      : "text-green-600"
+                      : "text-emerald-700"
                   }`}
                 >
                   {alertStatus === "missing"
@@ -167,14 +169,14 @@ export default function CameraSection() {
               </div>
               <div
                 className={`p-3 rounded-full ${
-                  alertStatus === "missing" ? "bg-red-100" : "bg-green-100"
+                  alertStatus === "missing" ? "bg-red-100" : "bg-emerald-100"
                 }`}
               >
                 <svg
                   className={`w-8 h-8 ${
                     alertStatus === "missing"
                       ? "text-red-600"
-                      : "text-green-600"
+                      : "text-emerald-700"
                   }`}
                   fill="none"
                   stroke="currentColor"
@@ -192,19 +194,19 @@ export default function CameraSection() {
           </div>
 
           {/* Alert Count Card */}
-          <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-purple-500">
+          <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-emerald-700">
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm text-gray-500 font-medium">
                   Total Kejadian
                 </p>
-                <p className="text-2xl font-bold text-purple-600 mt-1">
+                <p className="text-2xl font-bold text-emerald-700 mt-1">
                   {history.length}
                 </p>
               </div>
-              <div className="p-3 rounded-full bg-purple-100">
+              <div className="p-3 rounded-full bg-emerald-100">
                 <svg
-                  className="w-8 h-8 text-purple-600"
+                  className="w-8 h-8 text-emerald-700"
                   fill="none"
                   stroke="currentColor"
                   viewBox="0 0 24 24"
@@ -222,11 +224,11 @@ export default function CameraSection() {
         </div>
 
         {/* Main Content Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 sm:px-7 px-4 pb-6">
           {/* Left Column - Camera Feed */}
           <div className="lg:col-span-2 space-y-6">
             {/* Controls Card */}
-            <div className="bg-white rounded-xl shadow-lg p-6">
+            <div className="bg-white rounded-xl shadow-lg p-6 ">
               <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center">
                 <svg
                   className="w-6 h-6 mr-2 text-blue-600"
@@ -355,7 +357,7 @@ export default function CameraSection() {
                     d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
                   />
                 </svg>
-                Live Feed
+                Live Camera
               </h2>
 
               {active ? (
@@ -392,7 +394,7 @@ export default function CameraSection() {
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-xl font-bold text-gray-800 flex items-center">
                   <svg
-                    className="w-6 h-6 mr-2 text-purple-600"
+                    className="w-6 h-6 mr-2 text-emerald-700"
                     fill="none"
                     stroke="currentColor"
                     viewBox="0 0 24 24"

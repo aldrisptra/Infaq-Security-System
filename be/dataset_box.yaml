@@ -1,7 +1,11 @@
-# dataset_box.yaml
+# Satu kelas: kotak_infaq
 path: C:/Users/ALDRI/Documents/PROYEK/dataset_box
+
 train: images/train
 val: images/val
+# test: images/test     # aktifkan kalau foldernya ada
 
-nc: 1
-names: [kotak_infaq]
+names:
+  - kotak_infaq
+# nc boleh dihapus (Ultralytics bisa hitung dari names), atau biarkan:
+# nc: 1

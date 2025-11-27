@@ -108,6 +108,13 @@ WARN_THRESHOLD   = float(os.getenv("WARN_THRESHOLD",  "0.40"))
 ALERT_THRESHOLD  = float(os.getenv("ALERT_THRESHOLD", "0.70"))
 PRESENT_GRACE    = int(os.getenv("PRESENT_GRACE", "10"))
 
+
+
+LABEL_DISPLAY = {
+    "box": "Kotak Infaq",
+    "donation_box": "Kotak Amal",
+}
+
 # YOLO weights
 DEFAULT_WEIGHT = BASE_DIR / "best.pt"
 ALT_WEIGHT     = BASE_DIR / "runs" / "detect" / "train_box" / "weights" / "best.pt"
@@ -255,13 +262,16 @@ def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
 
     for (x1, y1, x2, y2, conf_b, cls_id, label) in dets_target[:50]:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 0), 2)
-        cv2.putText(frame, f"{label} {conf_b:.2f}", (x1, max(12, y1 - 6)),
+
+        display_label = LABEL_DISPLAY.get(label.lower(), label)
+        cv2.putText(frame, f"{display_label} {conf_b:.2f}", (x1, max(12, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 0), 2, cv2.LINE_AA)
 
     if DEBUG_LOG and (counter % 15 == 0):
         print(f"[DEBUG] boxes={n_total} kept={len(dets_target)} drop(label/area/center)={drop_label}/{drop_area}/{drop_center}")
 
     return dets_target
+
 
 # ========= Util sumber video =========
 def _open_source(source: str, index: int, path: Optional[str]) -> cv2.VideoCapture:

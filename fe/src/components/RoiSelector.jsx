@@ -1,195 +1,180 @@
+// src/components/RoiSelector.jsx
 import { useEffect, useRef, useState } from "react";
 
-/**
- * streamUrl: URL MJPEG
- * apiBase:   http://host:port untuk REST (snapshot & ROI)
- */
+function getAuthHeaders() {
+  const token = localStorage.getItem("authToken");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export default function RoiSelector({ streamUrl, apiBase }) {
   const containerRef = useRef(null);
-
-  const [roi, setRoi] = useState(null); // {x,y,w,h} relatif
+  const [roi, setRoi] = useState(null); // {x, y, w, h} dalam 0–1
   const [dragging, setDragging] = useState(false);
-  const [start, setStart] = useState(null); // {x,y}
-  const [tempRect, setTempRect] = useState(null);
-  const [imgErr, setImgErr] = useState(false);
-  const [altSrc, setAltSrc] = useState(null);
+  const [startPos, setStartPos] = useState(null);
+  const [statusText, setStatusText] = useState("");
 
-  // Ambil ROI tersimpan
+  // Ambil ROI awal dari backend
   useEffect(() => {
-    (async () => {
+    async function fetchROI() {
       try {
-        const r = await fetch(`${apiBase}/roi`);
-        const data = await r.json();
-        if (data?.roi) setRoi(data.roi);
-      } catch (e) {
-        console.warn("GET /roi gagal", e);
+        const res = await fetch(`${apiBase}/roi`, {
+          headers: {
+            Accept: "application/json",
+            ...getAuthHeaders(),
+          },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data?.roi) {
+          setRoi(data.roi);
+        }
+      } catch (err) {
+        console.error("Gagal ambil ROI:", err);
       }
-    })();
+    }
+
+    fetchROI();
   }, [apiBase]);
 
-  // Fallback snapshot polling jika MJPEG gagal
-  useEffect(() => {
-    let timer;
-    const tick = () => {
-      const u = `${apiBase}/camera/snapshot?ts=${Date.now()}`;
-      setAltSrc(u);
-      timer = setTimeout(tick, 300);
-    };
-    if (imgErr) tick();
-    return () => timer && clearTimeout(timer);
-  }, [imgErr, apiBase]);
+  const clamp01 = (v) => Math.min(1, Math.max(0, v));
 
-  // Hitung posisi relatif 0..1
-  const relPos = (e) => {
-    const rect = containerRef.current.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width;
-    const y = (e.clientY - rect.top) / rect.height;
-    return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
-    // clamp 0..1
-  };
-
-  const onMouseDown = (e) => {
+  const handleMouseDown = (e) => {
     if (!containerRef.current) return;
-    const p = relPos(e);
-    setStart(p);
-    setTempRect({ x: p.x, y: p.y, w: 0, h: 0 });
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = clamp01((e.clientX - rect.left) / rect.width);
+    const y = clamp01((e.clientY - rect.top) / rect.height);
+
+    setStartPos({ x, y });
+    setRoi({ x, y, w: 0, h: 0 });
     setDragging(true);
   };
 
-  const onMouseMove = (e) => {
-    if (!dragging || !start) return;
-    const p = relPos(e);
-    const x = Math.min(start.x, p.x);
-    const y = Math.min(start.y, p.y);
-    const w = Math.abs(p.x - start.x);
-    const h = Math.abs(p.y - start.y);
-    setTempRect({ x, y, w, h });
+  const handleMouseMove = (e) => {
+    if (!dragging || !containerRef.current || !startPos) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = clamp01((e.clientX - rect.left) / rect.width);
+    const y = clamp01((e.clientY - rect.top) / rect.height);
+
+    const x1 = startPos.x;
+    const y1 = startPos.y;
+    const left = Math.min(x1, x);
+    const top = Math.min(y1, y);
+    const w = Math.abs(x - x1);
+    const h = Math.abs(y - y1);
+
+    setRoi({ x: left, y: top, w, h });
   };
 
-  const onMouseUp = () => {
-    if (tempRect && tempRect.w > 0.002 && tempRect.h > 0.002) {
-      setRoi(tempRect);
-    }
+  const endDrag = () => {
     setDragging(false);
-    setStart(null);
-    setTempRect(null);
+    setStartPos(null);
   };
 
-  const saveROI = async () => {
-    if (!roi) return;
-    const payload = {
-      x: +roi.x.toFixed(6),
-      y: +roi.y.toFixed(6),
-      w: +roi.w.toFixed(6),
-      h: +roi.h.toFixed(6),
-    };
-    const r = await fetch(`${apiBase}/roi`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!r.ok) return alert("Gagal menyimpan ROI: " + (await r.text()));
-    alert("ROI tersimpan!");
-  };
+  async function handleSave() {
+    try {
+      if (!roi || roi.w === 0 || roi.h === 0) {
+        setStatusText("Gambar dulu area ROI di atas video.");
+        return;
+      }
+      setStatusText("Menyimpan ROI...");
 
-  const clearROI = async () => {
-    await fetch(`${apiBase}/roi`, { method: "DELETE" });
-    setRoi(null);
-  };
+      const res = await fetch(`${apiBase}/roi`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify(roi),
+      });
 
-  const styleFromROI = (r) => ({
-    position: "absolute",
-    left: `${r.x * 100}%`,
-    top: `${r.y * 100}%`,
-    width: `${r.w * 100}%`,
-    height: `${r.h * 100}%`,
-    border: "2px solid rgba(34,197,94,0.9)",
-    background: "rgba(34,197,94,0.1)",
-    borderRadius: 6,
-    pointerEvents: "none",
-  });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || "Gagal menyimpan ROI");
+      }
+
+      setStatusText("ROI berhasil disimpan ✅");
+    } catch (err) {
+      console.error(err);
+      setStatusText(err.message || "Gagal menyimpan ROI");
+    }
+  }
+
+  async function handleClear() {
+    try {
+      setStatusText("Menghapus ROI...");
+      await fetch(`${apiBase}/roi`, {
+        method: "DELETE",
+        headers: {
+          ...getAuthHeaders(),
+        },
+      });
+      setRoi(null);
+      setStatusText("ROI dihapus.");
+    } catch (err) {
+      console.error(err);
+      setStatusText("Gagal menghapus ROI");
+    }
+  }
 
   return (
-    <div>
+    <div className="space-y-3">
       <div
         ref={containerRef}
-        style={{
-          position: "relative",
-          width: "100%",
-          maxWidth: 900,
-          margin: "0 auto",
-          userSelect: "none",
-        }}
+        className="relative w-full bg-black rounded-lg overflow-hidden cursor-crosshair aspect-video"
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={endDrag}
+        onMouseLeave={endDrag}
       >
-        {/* Stream */}
-        <img
-          src={altSrc || streamUrl}
-          alt="camera"
-          style={{ width: "100%", display: "block" }}
-          draggable={false}
-          onError={() => setImgErr(true)}
-          onLoad={() => setImgErr(false)}
-        />
+        {streamUrl ? (
+          <img
+            src={streamUrl}
+            alt="Camera stream"
+            className="w-full h-full object-contain select-none pointer-events-none"
+            draggable={false}
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center text-gray-400 text-sm">
+            Stream belum tersedia
+          </div>
+        )}
 
-        {/* Layer untuk drag */}
-        <div
-          onMouseDown={onMouseDown}
-          onMouseMove={onMouseMove}
-          onMouseUp={onMouseUp}
-          style={{ position: "absolute", inset: 0, cursor: "crosshair" }}
-        />
-
-        {/* ROI tersimpan */}
-        {roi && <div style={styleFromROI(roi)} />}
-
-        {/* ROI sementara (biru) */}
-        {tempRect && (
+        {roi && roi.w > 0 && roi.h > 0 && (
           <div
+            className="absolute border-2 border-amber-400 bg-amber-300/10"
             style={{
-              position: "absolute",
-              left: `${tempRect.x * 100}%`,
-              top: `${tempRect.y * 100}%`,
-              width: `${tempRect.w * 100}%`,
-              height: `${tempRect.h * 100}%`,
-              border: "2px solid rgba(59,130,246,0.9)",
-              background: "rgba(59,130,246,0.1)",
-              borderRadius: 6,
-              pointerEvents: "none",
+              left: `${roi.x * 100}%`,
+              top: `${roi.y * 100}%`,
+              width: `${roi.w * 100}%`,
+              height: `${roi.h * 100}%`,
             }}
           />
         )}
       </div>
 
-      {imgErr && (
-        <p style={{ textAlign: "center", color: "#b45309", marginTop: 8 }}>
-          MJPEG gagal dimuat, menampilkan snapshot (fallback).
-        </p>
-      )}
+      <p className="text-xs text-gray-600">
+        🖱️ Klik & drag pada video untuk menentukan area kotak infaq (ROI).{" "}
+        Kemudian klik <span className="font-semibold">Simpan ROI</span>.
+      </p>
 
-      <div
-        style={{
-          marginTop: 12,
-          display: "flex",
-          gap: 8,
-          justifyContent: "center",
-        }}
-      >
+      <div className="flex gap-3">
         <button
-          onClick={saveROI}
-          disabled={!roi}
-          style={{ padding: "8px 14px" }}
+          type="button"
+          onClick={handleSave}
+          className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 transition"
         >
           Simpan ROI
         </button>
-        <button onClick={clearROI} style={{ padding: "8px 14px" }}>
+        <button
+          type="button"
+          onClick={handleClear}
+          className="px-4 py-2 rounded-lg border border-gray-300 text-gray-700 text-sm hover:bg-gray-50 transition"
+        >
           Hapus ROI
         </button>
       </div>
 
-      <p style={{ textAlign: "center", color: "#6b7280", marginTop: 8 }}>
-        Tips: drag di atas video untuk memilih area kotak infaq, lalu klik
-        “Simpan ROI”.
-      </p>
+      {statusText && <p className="text-xs text-gray-500 mt-1">{statusText}</p>}
     </div>
   );
 }

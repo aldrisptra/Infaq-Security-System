@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import RoiSelector from "./RoiSelector.jsx";
+import Header from "./Header.jsx";
 
 const API_BASE = "http://localhost:8000";
 
@@ -11,6 +13,7 @@ export default function CameraSection() {
   const [statusText, setStatusText] = useState("");
   const [alertStatus, setAlertStatus] = useState(null);
   const [history, setHistory] = useState([]);
+  const navigate = useNavigate();
 
   // Fetch camera status
   const refreshStatus = async () => {
@@ -92,12 +95,32 @@ export default function CameraSection() {
     }
   };
 
+  const handleLogout = async () => {
+    try {
+      // kalau kamera lagi aktif, kita stop dulu (biar rapi)
+      if (active) {
+        await stopCam();
+      }
+    } catch (e) {
+      console.error("Gagal stop kamera saat logout:", e);
+    }
+
+    // hapus token auth
+    localStorage.removeItem("authToken");
+
+    // arahkan balik ke halaman login
+    navigate("/login", { replace: true });
+  };
+
   const clearHistory = () => {
     setHistory([]);
   };
 
   return (
     <div className="min-h-screen bg-emerald-900">
+      {/* Navbar + tombol Logout */}
+      <Header onLogout={handleLogout} />
+
       <div className="max-w-7xl mx-auto">
         {/* Status Cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 py-6 px-4 sm:px-7">
@@ -222,7 +245,6 @@ export default function CameraSection() {
             </div>
           </div>
         </div>
-
         {/* Main Content Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 sm:px-7 px-4 pb-6">
           {/* Left Column - Camera Feed */}

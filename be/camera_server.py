@@ -5,9 +5,18 @@ import cv2
 import numpy as np
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
+
+from jose import JWTError, jwt
+from sqlalchemy.orm import Session
+
+from database import get_db
+from models import User, Masjid, Camera
+
+from datetime import datetime, timedelta
 
 from pydantic import BaseModel, confloat
 from ultralytics import YOLO
@@ -25,6 +34,100 @@ app.add_middleware(
 def root():
     return {"ok": True, "msg": "camera_server up"}
 
+# ========= AUTH CONFIG =========
+SECRET_KEY = "ganti-dengan-string-random-panjang"  # ideal taro di .env
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class CurrentUser(BaseModel):
+    id: int
+    username: str
+    id_masjid: int
+    role: str
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def verify_password(plain: str, stored: str) -> bool:
+    # Untuk sekarang, password disimpan plain text di DB → bandingkan langsung
+    # Nanti bisa diupgrade pakai hash (bcrypt)
+    return plain == stored
+
+
+def get_user_by_username(db: Session, username: str) -> Optional[User]:
+    return db.query(User).filter(User.username == username).first()
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+) -> CurrentUser:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Token tidak valid",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: Optional[str] = payload.get("sub")
+        masjid_id: Optional[int] = payload.get("masjid_id")
+        role: Optional[str] = payload.get("role")
+        if user_id is None or masjid_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if user is None:
+        raise credentials_exception
+
+    return CurrentUser(
+        id=user.id,
+        username=user.username,
+        id_masjid=user.id_masjid,
+        role=user.role,
+    )
+
+# ========= LOGIN ENDPOINT =========
+@app.post("/auth/login", response_model=Token)
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    # Ambil user dari DB berdasarkan username
+    user = get_user_by_username(db, form_data.username)
+    if not user or not verify_password(form_data.password, user.password):
+        raise HTTPException(status_code=401, detail="Username atau password salah")
+
+    access_token = create_access_token(
+        data={
+            "sub": str(user.id),
+            "masjid_id": user.id_masjid,
+            "role": user.role,
+        }
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+
 # ========= Global State =========
 cap: Optional[cv2.VideoCapture] = None
 running = False
@@ -36,79 +139,118 @@ alert_status = "present"  # "present" | "missing"
 last_alert_photo_ts = 0.0
 
 # info sumber saat ini
-CUR_SOURCE = "webcam"         
-CUR_INDEX  = 0                
-CUR_PATH   = None          
-CUR_LOOP   = False           
+CUR_SOURCE = "webcam"
+CUR_INDEX  = 0
+CUR_PATH   = None
+CUR_LOOP   = False
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# ========= ROI  =========
-class ROI(BaseModel):
+# ========= ROI (FILE-BASED, DILINDUNGI AUTH) =========
+# ========= ROI (FILE-BASED, DILINDUNGI AUTH) =========
+class ROISchema(BaseModel):
     x: confloat(ge=0.0, le=1.0)
     y: confloat(ge=0.0, le=1.0)
     w: confloat(ge=0.0, le=1.0)
     h: confloat(ge=0.0, le=1.0)
 
+
 ROI_PATH = BASE_DIR / "roi_config.json"
 
-def _roi_dump(roi: ROI) -> dict:
+
+def _roi_dump(roi: ROISchema | None) -> dict | None:
+    if roi is None:
+        return None
+    # Pydantic v1 vs v2 compatibility
     return getattr(roi, "model_dump", lambda: json.loads(roi.json()))()
 
-def load_roi_rel() -> Optional[ROI]:
-    if ROI_PATH.exists():
-        data = json.loads(ROI_PATH.read_text(encoding="utf-8"))
-        return ROI(**data)
-    return None
 
-def save_roi_rel(roi: ROI) -> None:
-    if hasattr(roi, "model_dump_json"):
-        ROI_PATH.write_text(roi.model_dump_json(), encoding="utf-8")
-    else:
-        ROI_PATH.write_text(roi.json(), encoding="utf-8")
+def load_roi_rel() -> Optional[ROISchema]:
+    """Load ROI dari file JSON (0–1). Kalau ada error, kembalikan None."""
+    if not ROI_PATH.exists():
+        return None
+
+    try:
+        text = ROI_PATH.read_text(encoding="utf-8").strip()
+        if not text:
+            return None
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            print("[ROI] data di file bukan object dict:", data)
+            return None
+        return ROISchema(**data)
+    except Exception as e:
+        print("[ROI] error saat load file roi_config.json:", e)
+        return None
+
+
+def save_roi_rel(roi: ROISchema) -> None:
+    """Simpan ROI ke file sebagai JSON."""
+    try:
+        if hasattr(roi, "model_dump_json"):
+            ROI_PATH.write_text(roi.model_dump_json(), encoding="utf-8")
+        else:
+            ROI_PATH.write_text(roi.json(), encoding="utf-8")
+    except Exception as e:
+        print("[ROI] error saat save file roi_config.json:", e)
+
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
 
 def get_roi_rect_pixels(frame_shape) -> Optional[Tuple[int, int, int, int]]:
     roi = load_roi_rel()
     if not roi:
         return None
     H, W = frame_shape[:2]
-    x1 = clamp(int(roi.x * W), 0, W-1)
-    y1 = clamp(int(roi.y * H), 0, H-1)
+    x1 = clamp(int(roi.x * W), 0, W - 1)
+    y1 = clamp(int(roi.y * H), 0, H - 1)
     x2 = clamp(int((roi.x + roi.w) * W), 1, W)
     y2 = clamp(int((roi.y + roi.h) * H), 1, H)
     if x2 - x1 < 4 or y2 - y1 < 4:
         return None
     return (x1, y1, x2, y2)
 
-@app.get("/roi")
-def get_roi():
-    roi = load_roi_rel()
-    return {"roi": _roi_dump(roi) if roi else None}
 
-@app.post("/roi")
-def set_roi(roi: ROI):
+class ROIResponse(BaseModel):
+    roi: Optional[ROISchema] = None
+
+
+@app.get("/roi", response_model=ROIResponse)
+def get_roi(current_user: CurrentUser = Depends(get_current_user)):
+    roi = load_roi_rel()
+    return ROIResponse(roi=roi)
+
+
+@app.post("/roi", response_model=ROIResponse)
+def set_roi(
+    roi: ROISchema,
+    current_user: CurrentUser = Depends(get_current_user),
+):
     if roi.w <= 0 or roi.h <= 0:
         raise HTTPException(400, "w/h harus > 0")
     if roi.x + roi.w > 1 or roi.y + roi.h > 1:
         raise HTTPException(400, "ROI keluar dari frame")
     save_roi_rel(roi)
-    return {"ok": True, "roi": _roi_dump(roi)}
+    return ROIResponse(roi=roi)
+
 
 @app.delete("/roi")
-def clear_roi():
-    ROI_PATH.unlink(missing_ok=True)
+def clear_roi(current_user: CurrentUser = Depends(get_current_user)):
+    try:
+        ROI_PATH.unlink(missing_ok=True)
+    except Exception as e:
+        print("[ROI] error saat hapus roi_config.json:", e)
     return {"ok": True}
+
+
 
 # ========= Konfigurasi =========
 MISSING_WINDOW   = int(os.getenv("MISSING_WINDOW",  "24"))
 WARN_THRESHOLD   = float(os.getenv("WARN_THRESHOLD",  "0.40"))
 ALERT_THRESHOLD  = float(os.getenv("ALERT_THRESHOLD", "0.70"))
 PRESENT_GRACE    = int(os.getenv("PRESENT_GRACE", "10"))
-
-
 
 LABEL_DISPLAY = {
     "box": "Kotak Infaq",
@@ -122,10 +264,10 @@ if (not DEFAULT_WEIGHT.is_file()) and ALT_WEIGHT.is_file():
     DEFAULT_WEIGHT = ALT_WEIGHT
 YOLO_WEIGHTS    = os.getenv("YOLO_WEIGHTS", str(DEFAULT_WEIGHT))
 
-YOLO_CONF_DEF   = float(os.getenv("YOLO_CONF", "0.25"))
-YOLO_IOU_DEF    = float(os.getenv("YOLO_IOU", "0.60"))
+YOLO_CONF_DEF   = float(os.getenv("YOLO_CONF", "0.5"))
+YOLO_IOU_DEF    = float(os.getenv("YOLO_IOU", "0.90"))
 YOLO_IMG_DEF    = int(os.getenv("YOLO_IMG",  "800"))
-MIN_AREA_RATIO  = float(os.getenv("MIN_AREA_RATIO", "0.001"))
+MIN_AREA_RATIO  = float(os.getenv("MIN_AREA_RATIO", "0.01"))
 INFER_EVERY     = int(os.getenv("INFER_EVERY", "1"))
 
 CAM_BACKEND     = os.getenv("CAM_BACKEND", "DSHOW").upper()
@@ -287,6 +429,7 @@ def _open_source(source: str, index: int, path: Optional[str]) -> cv2.VideoCaptu
             raise ValueError("path video kosong")
         return cv2.VideoCapture(path)
 
+
 # ========= Capture loop =========
 def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=False):
     global cap, running, latest_jpeg, alert_status, last_alert_photo_ts
@@ -304,7 +447,7 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
         running = False
         return
 
-    # set resolusi untuk webcam 
+    # set resolusi untuk webcam
     if source == "webcam":
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -332,13 +475,12 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
     while running:
         ok, frame = cap.read()
         if not ok:
-       
+
             if source == "video" and loop_video:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
             time.sleep(0.02)
             continue
-        
 
         counter += 1
 
@@ -379,30 +521,25 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
             absent_hist.pop(0)
         avg_absent = float(np.mean(absent_hist)) if absent_hist else (0.0 if present else 1.0)
 
-        status = "NORMAL"
+        status_str = "NORMAL"
         if avg_absent >= ALERT_THRESHOLD:
-            status = "ALERT"
+            status_str = "ALERT"
         elif avg_absent >= WARN_THRESHOLD:
-            status = "WARN"
-        status = "NORMAL"
-        if avg_absent >= ALERT_THRESHOLD:
-            status = "ALERT"
-        elif avg_absent >= WARN_THRESHOLD:
-            status = "WARN"
+            status_str = "WARN"
 
         # Update alert status
         old_alert = alert_status
-        if status == "ALERT":
+        if status_str == "ALERT":
             alert_status = "missing"
         else:
             alert_status = "present"
 
         # Kirim foto ke Telegram saat ALERT pertama kali
-        if TG_TOKEN and TG_CHAT_ID and status == "ALERT" and old_alert != "missing":
+        if TG_TOKEN and TG_CHAT_ID and status_str == "ALERT" and old_alert != "missing":
             now = time.time()
             if now - last_alert_photo_ts > TG_COOLDOWN_S:
                 last_alert_photo_ts = now
-                
+
                 # Encode frame ke JPG untuk dikirim
                 ok_jpg, jpg_buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                 if ok_jpg:
@@ -412,9 +549,9 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
         # Gambar ROI rectangle
         if roi_rect:
             cv2.rectangle(frame, (roi_rect[0], roi_rect[1]), (roi_rect[2], roi_rect[3]), (255, 165, 0), 2)
-        color = (0, 255, 255) if status == "NORMAL" else ((0, 165, 255) if status == "WARN" else (0, 0, 255))
+        color = (0, 255, 255) if status_str == "NORMAL" else ((0, 165, 255) if status_str == "WARN" else (0, 0, 255))
         H, W = frame.shape[:2]
-        hud = f"Status: {status} | absent≈{avg_absent:.2f} | dets={len(dets)}"
+        hud = f"Status: {status_str} | absent≈{avg_absent:.2f} | dets={len(dets)}"
         font = cv2.FONT_HERSHEY_SIMPLEX; scale = 0.6; thickness = 2
         (text_w, text_h), baseline = cv2.getTextSize(hud, font, scale, thickness)
         pad_x = 12; pad_y = 8
@@ -427,7 +564,7 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
         text_x = x1 + pad_x; text_y = y2 - pad_y - baseline
         cv2.putText(frame, hud, (text_x, text_y + text_h - baseline), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
-        last_status = status
+        last_status = status_str
 
         ok2, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         if ok2:
@@ -438,7 +575,7 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
 
     if cap:
         cap.release()
-        
+
 
 # ========= MJPEG generator =========
 def mjpeg_gen():
@@ -451,12 +588,14 @@ def mjpeg_gen():
                    b"Content-Type: image/jpeg\r\n\r\n" + buf + b"\r\n")
         time.sleep(0.02)
 
+
+# ========= API kamera =========
 # ========= API kamera =========
 @app.get("/camera/status")
-def status():
+def get_camera_status():
     return {
         "running": running,
-        "alert_status": alert_status, 
+        "alert_status": alert_status,
         "source": CUR_SOURCE,
         "index": CUR_INDEX,
         "path": CUR_PATH,
@@ -468,6 +607,7 @@ def status():
         "infer_every": INFER_EVERY,
         "roi_file": str(ROI_PATH),
     }
+
 
 @app.post("/camera/start")
 def start(
@@ -488,11 +628,13 @@ def start(
     ).start()
     return {"ok": True, "source": source, "index": index, "path": path, "loop": loop}
 
+
 @app.post("/camera/stop")
 def stop():
     global running
     running = False
     return {"ok": True}
+
 
 @app.get(
     "/camera/stream",

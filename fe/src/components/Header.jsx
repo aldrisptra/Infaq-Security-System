@@ -41,7 +41,7 @@ export default function Header({ onLogout }) {
               <button
                 type="button"
                 onClick={onLogout}
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-emerald-700 text-white hover:bg-emerald-600 active:scale-95 transition"
+                className="px-4 py-2 rounded-lg text-sm font-medium bg-teal-600 text-white hover:bg-teal-700 active:scale-95 transition"
               >
                 Logout
               </button>

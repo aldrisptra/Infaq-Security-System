@@ -1,7 +1,8 @@
 # models.py
 from sqlalchemy import (
-    Column, Integer, String, Text, Enum, Float, ForeignKey, Boolean
+    Column, Integer, String, Text, DateTime, ForeignKey, Enum
 )
+from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 
 from database import Base
@@ -10,48 +11,78 @@ from database import Base
 class Masjid(Base):
     __tablename__ = "masjid"
 
-    id = Column(Integer, primary_key=True, index=True)
-    nama = Column(String(100), nullable=False)
-    alamat = Column(Text)
+    id_masjid = Column(Integer, primary_key=True, autoincrement=True)
+    nama = Column(String(150), nullable=False)
+    alamat = Column(Text, nullable=True)
 
-    users = relationship("User", back_populates="masjid")
+    created_at = Column(DateTime, server_default=func.current_timestamp(), nullable=False)
+
+    tg_chat_id = Column(String(64), nullable=True)
+    tg_cooldown = Column(Integer, nullable=False, default=10)
+
     cameras = relationship("Camera", back_populates="masjid")
+    users = relationship("User", back_populates="masjid")
+
+    # alias supaya code lama yang pakai masjid.id tetap jalan
+    @property
+    def id(self):
+        return self.id_masjid
+
+
+class Camera(Base):
+    __tablename__ = "camera"
+
+    id_camera = Column(Integer, primary_key=True, autoincrement=True)
+
+    id_masjid = Column(
+        Integer,
+        ForeignKey("masjid.id_masjid", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    nama = Column(String(120), nullable=False)
+
+    source_type = Column(
+        Enum("webcam", "video", "ipcam"),
+        nullable=False,
+        default="webcam"
+    )
+    source_index = Column(Integer, nullable=True)
+    source_path = Column(Text, nullable=True)
+
+    status = Column(
+        Enum("aktif", "nonaktif"),
+        nullable=False,
+        default="aktif"
+    )
+
+    created_at = Column(DateTime, server_default=func.current_timestamp(), nullable=False)
+
+    masjid = relationship("Masjid", back_populates="cameras")
+
+    # alias opsional
+    @property
+    def id(self):
+        return self.id_camera
 
 
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    id_masjid = Column(Integer, ForeignKey("masjid.id"), nullable=False)
-    username = Column(String(50), unique=True, index=True, nullable=False)
-    password = Column(String(255), nullable=False)  # untuk sekarang plain text dulu
-    role = Column(String(20), default="admin")      # 'admin' / 'superadmin'
+    # sesuai DESCRIBE kamu: PK-nya namanya "d"
+    # kita map attribute "id" ke column DB "d"
+    id = Column("id", Integer, primary_key=True, autoincrement=True)
+
+    id_masjid = Column(
+        Integer,
+        ForeignKey("masjid.id_masjid", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    username = Column(String(100), unique=True, nullable=False)
+    password = Column(String(255), nullable=False)
+    role = Column(String(30), nullable=False, default="admin_masjid")
+
+    created_at = Column(DateTime, server_default=func.current_timestamp(), nullable=False)
 
     masjid = relationship("Masjid", back_populates="users")
-
-
-class Camera(Base):
-    __tablename__ = "cameras"
-
-    id = Column(Integer, primary_key=True, index=True)
-    id_masjid = Column(Integer, ForeignKey("masjid.id"), nullable=False)
-    name = Column(String(100), nullable=False)
-    source_type = Column(String(20), nullable=False) 
-    source_url = Column(Text, nullable=False)
-    is_active = Column(Boolean, default=True)
-
-    masjid = relationship("Masjid", back_populates="cameras")
-    roi = relationship("ROI", back_populates="camera", uselist=False)
-
-
-class ROI(Base):
-    __tablename__ = "rois"
-
-    id = Column(Integer, primary_key=True, index=True)
-    id_camera = Column(Integer, ForeignKey("cameras.id"), unique=True, nullable=False)
-    x1 = Column(Float, nullable=False)
-    y1 = Column(Float, nullable=False)
-    x2 = Column(Float, nullable=False)
-    y2 = Column(Float, nullable=False)
-
-    camera = relationship("Camera", back_populates="roi")

@@ -1,131 +1,44 @@
-﻿import os, time, threading, json
+﻿# camera_server.py
+import os, time, threading, json
 from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Depends, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
-
-from jose import JWTError, jwt
-from sqlalchemy.orm import Session
-
-from database import get_db
-from models import User, Masjid, Camera
-
-from datetime import datetime, timedelta
 
 from pydantic import BaseModel, confloat
 from ultralytics import YOLO
 import httpx
 
-# ========= FastAPI  =========
+from sqlalchemy.orm import Session
+from database import get_db
+from models import Camera
+
+# ====== IMPORT AUTH ======
+from auth import router as auth_router
+from auth import get_current_user, CurrentUser
+
+
+# ========= FastAPI =========
 app = FastAPI(docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+app.include_router(auth_router)
+
 
 @app.get("/")
 def root():
     return {"ok": True, "msg": "camera_server up"}
-
-# ========= AUTH CONFIG =========
-SECRET_KEY = "ganti-dengan-string-random-panjang"  # ideal taro di .env
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-
-class CurrentUser(BaseModel):
-    id: int
-    username: str
-    id_masjid: int
-    role: str
-
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
-def verify_password(plain: str, stored: str) -> bool:
-    # Untuk sekarang, password disimpan plain text di DB → bandingkan langsung
-    # Nanti bisa diupgrade pakai hash (bcrypt)
-    return plain == stored
-
-
-def get_user_by_username(db: Session, username: str) -> Optional[User]:
-    return db.query(User).filter(User.username == username).first()
-
-
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
-) -> CurrentUser:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Token tidak valid",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: Optional[str] = payload.get("sub")
-        masjid_id: Optional[int] = payload.get("masjid_id")
-        role: Optional[str] = payload.get("role")
-        if user_id is None or masjid_id is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-
-    user = db.query(User).filter(User.id == int(user_id)).first()
-    if user is None:
-        raise credentials_exception
-
-    return CurrentUser(
-        id=user.id,
-        username=user.username,
-        id_masjid=user.id_masjid,
-        role=user.role,
-    )
-
-# ========= LOGIN ENDPOINT =========
-@app.post("/auth/login", response_model=Token)
-def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db),
-):
-    # Ambil user dari DB berdasarkan username
-    user = get_user_by_username(db, form_data.username)
-    if not user or not verify_password(form_data.password, user.password):
-        raise HTTPException(status_code=401, detail="Username atau password salah")
-
-    access_token = create_access_token(
-        data={
-            "sub": str(user.id),
-            "masjid_id": user.id_masjid,
-            "role": user.role,
-        }
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
-
 
 
 # ========= Global State =========
@@ -134,70 +47,122 @@ running = False
 latest_jpeg: Optional[bytes] = None
 lock = threading.Lock()
 
-# state alert
-alert_status = "present"  # "present" | "missing"
+alert_status = "present"
 last_alert_photo_ts = 0.0
 
-# info sumber saat ini
-CUR_SOURCE = "webcam"
+CUR_SOURCE = "webcam"   # webcam | video | ipcam
 CUR_INDEX  = 0
 CUR_PATH   = None
 CUR_LOOP   = False
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# ========= ROI (FILE-BASED, DILINDUNGI AUTH) =========
-# ========= ROI (FILE-BASED, DILINDUNGI AUTH) =========
+
+# ========= Helpers DB camera =========
+def _get_camera_id_col():
+    # antisipasi nama kolom id berbeda di model
+    return getattr(Camera, "id", None) or getattr(Camera, "id_camera", None)
+
+def _get_latest_camera_for_masjid(db: Session, masjid_id: int) -> Optional[Camera]:
+    q = db.query(Camera).filter(Camera.id_masjid == masjid_id)
+    cam_id_col = _get_camera_id_col()
+    if cam_id_col is not None:
+        q = q.order_by(cam_id_col.desc())
+    return q.first()
+
+
+# ========= Default camera from DB =========
+@app.get("/camera/default")
+def get_default_camera(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    cam = _get_latest_camera_for_masjid(db, current_user.id_masjid)
+
+    # fallback kalau belum ada kamera di DB
+    if not cam:
+        return {
+            "source": "webcam",
+            "index": 0,
+            "path": None,
+            "loop": True,
+            "camera_name": None,
+        }
+
+    source = getattr(cam, "source_type", None) or "ipcam"
+    path   = getattr(cam, "source_path", None)
+    index  = getattr(cam, "source_index", 0) or 0
+
+    if source not in ("webcam", "video", "ipcam"):
+        source = "ipcam"
+
+    return {
+        "source": source,
+        "index": index,
+        "path": path,
+        "loop": True,
+        "camera_name": getattr(cam, "nama", None),
+    }
+
+
+@app.post("/camera/start-default")
+def start_default_camera(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    cam = _get_latest_camera_for_masjid(db, current_user.id_masjid)
+    if not cam:
+        raise HTTPException(404, "Default camera belum ada di database")
+
+    source = getattr(cam, "source_type", None) or "ipcam"
+    path   = getattr(cam, "source_path", None)
+    index  = getattr(cam, "source_index", 0) or 0
+
+    if source not in ("webcam", "video", "ipcam"):
+        source = "ipcam"
+
+    # kalau ipcam/video tapi path kosong -> error jelas
+    if source in ("ipcam", "video") and not path:
+        raise HTTPException(400, "Default camera di database belum punya source_path")
+
+    return start(source=source, index=index, path=path, loop=True)
+
+
+# ========= ROI (FILE-BASED, AUTH) =========
 class ROISchema(BaseModel):
     x: confloat(ge=0.0, le=1.0)
     y: confloat(ge=0.0, le=1.0)
     w: confloat(ge=0.0, le=1.0)
     h: confloat(ge=0.0, le=1.0)
 
-
 ROI_PATH = BASE_DIR / "roi_config.json"
 
-
-def _roi_dump(roi: ROISchema | None) -> dict | None:
-    if roi is None:
-        return None
-    # Pydantic v1 vs v2 compatibility
-    return getattr(roi, "model_dump", lambda: json.loads(roi.json()))()
-
-
 def load_roi_rel() -> Optional[ROISchema]:
-    """Load ROI dari file JSON (0–1). Kalau ada error, kembalikan None."""
     if not ROI_PATH.exists():
         return None
-
     try:
         text = ROI_PATH.read_text(encoding="utf-8").strip()
         if not text:
             return None
         data = json.loads(text)
         if not isinstance(data, dict):
-            print("[ROI] data di file bukan object dict:", data)
             return None
         return ROISchema(**data)
     except Exception as e:
-        print("[ROI] error saat load file roi_config.json:", e)
+        print("[ROI] error load:", e)
         return None
 
-
 def save_roi_rel(roi: ROISchema) -> None:
-    """Simpan ROI ke file sebagai JSON."""
     try:
         if hasattr(roi, "model_dump_json"):
             ROI_PATH.write_text(roi.model_dump_json(), encoding="utf-8")
         else:
             ROI_PATH.write_text(roi.json(), encoding="utf-8")
     except Exception as e:
-        print("[ROI] error saat save file roi_config.json:", e)
-
+        print("[ROI] error save:", e)
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
-
 
 def get_roi_rect_pixels(frame_shape) -> Optional[Tuple[int, int, int, int]]:
     roi = load_roi_rel()
@@ -212,16 +177,12 @@ def get_roi_rect_pixels(frame_shape) -> Optional[Tuple[int, int, int, int]]:
         return None
     return (x1, y1, x2, y2)
 
-
 class ROIResponse(BaseModel):
     roi: Optional[ROISchema] = None
 
-
 @app.get("/roi", response_model=ROIResponse)
 def get_roi(current_user: CurrentUser = Depends(get_current_user)):
-    roi = load_roi_rel()
-    return ROIResponse(roi=roi)
-
+    return ROIResponse(roi=load_roi_rel())
 
 @app.post("/roi", response_model=ROIResponse)
 def set_roi(
@@ -235,18 +196,16 @@ def set_roi(
     save_roi_rel(roi)
     return ROIResponse(roi=roi)
 
-
 @app.delete("/roi")
 def clear_roi(current_user: CurrentUser = Depends(get_current_user)):
     try:
         ROI_PATH.unlink(missing_ok=True)
     except Exception as e:
-        print("[ROI] error saat hapus roi_config.json:", e)
+        print("[ROI] error delete:", e)
     return {"ok": True}
 
 
-
-# ========= Konfigurasi =========
+# ========= Konfigurasi Deteksi =========
 MISSING_WINDOW   = int(os.getenv("MISSING_WINDOW",  "24"))
 WARN_THRESHOLD   = float(os.getenv("WARN_THRESHOLD",  "0.40"))
 ALERT_THRESHOLD  = float(os.getenv("ALERT_THRESHOLD", "0.70"))
@@ -257,13 +216,12 @@ LABEL_DISPLAY = {
     "donation_box": "Kotak Amal",
 }
 
-# YOLO weights
 DEFAULT_WEIGHT = BASE_DIR / "best.pt"
 ALT_WEIGHT     = BASE_DIR / "runs" / "detect" / "train_box" / "weights" / "best.pt"
 if (not DEFAULT_WEIGHT.is_file()) and ALT_WEIGHT.is_file():
     DEFAULT_WEIGHT = ALT_WEIGHT
-YOLO_WEIGHTS    = os.getenv("YOLO_WEIGHTS", str(DEFAULT_WEIGHT))
 
+YOLO_WEIGHTS    = os.getenv("YOLO_WEIGHTS", str(DEFAULT_WEIGHT))
 YOLO_CONF_DEF   = float(os.getenv("YOLO_CONF", "0.5"))
 YOLO_IOU_DEF    = float(os.getenv("YOLO_IOU", "0.90"))
 YOLO_IMG_DEF    = int(os.getenv("YOLO_IMG",  "800"))
@@ -273,12 +231,11 @@ INFER_EVERY     = int(os.getenv("INFER_EVERY", "1"))
 CAM_BACKEND     = os.getenv("CAM_BACKEND", "DSHOW").upper()
 CAP_MAP = {"MSMF": cv2.CAP_MSMF, "DSHOW": cv2.CAP_DSHOW, "ANY": cv2.CAP_ANY}
 
-# ========= Target filter & ROI behavior =========
 TARGET_CLASS_IDS = {
     int(s) for s in os.getenv("TARGET_CLASS_IDS", "").split(",") if s.strip().isdigit()
 }
 CENTER_IN_ROI = int(os.getenv("CENTER_IN_ROI", "1")) == 1
-ROI_STRATEGY  = os.getenv("ROI_STRATEGY", "crop").lower()  # 'crop' | 'filter'
+ROI_STRATEGY  = os.getenv("ROI_STRATEGY", "crop").lower()
 REQUIRE_ROI   = int(os.getenv("REQUIRE_ROI", "0")) == 1
 
 TARGET_LABELS = {
@@ -288,6 +245,7 @@ TARGET_LABELS = {
 }
 
 DEBUG_LOG  = int(os.getenv("DEBUG_LOG", "1")) == 1
+
 def _matches_target(cls_id: int, label: str) -> bool:
     label_l = (label or "").lower()
     if TARGET_CLASS_IDS:
@@ -296,19 +254,11 @@ def _matches_target(cls_id: int, label: str) -> bool:
         return label_l in TARGET_LABELS
     return True
 
-# ========= Telegram via ENV  =========
-TG_TOKEN      = os.getenv("TG_TOKEN", "7697921487:AAEvZXLkC61Nzx-eh1e2BES1VfqSJ3wN32E")
-TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "1215968232")
-TG_COOLDOWN_S = int(os.getenv("TG_COOLDOWN", "10"))
 
-def send_telegram(text: str):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        httpx.post(url, data={"chat_id": TG_CHAT_ID, "text": text}, timeout=10.0)
-    except Exception as e:
-        print("[TG] gagal kirim pesan:", e)
+# ========= Telegram =========
+TG_TOKEN      = os.getenv("TG_TOKEN", "")
+TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "")
+TG_COOLDOWN_S = int(os.getenv("TG_COOLDOWN", "10"))
 
 def send_telegram_photo(jpg_bytes: bytes, caption: str = ""):
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -321,7 +271,8 @@ def send_telegram_photo(jpg_bytes: bytes, caption: str = ""):
     except Exception as e:
         print("[TG] gagal kirim foto:", e)
 
-# ========= YOLO  =========
+
+# ========= YOLO Model =========
 _yolo_model = None
 _model_names = None
 
@@ -338,9 +289,9 @@ def _ensure_model(weights_path: str, conf: float, iou: float, imgsz: int):
 
 def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
     if _yolo_model is None:
-        return
+        return []
     if counter % INFER_EVERY != 0:
-        return
+        return []
 
     H, W = frame.shape[:2]
     use_crop = (roi_rect is not None) and (ROI_STRATEGY == "crop")
@@ -354,7 +305,9 @@ def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
             max_det=50, device="cpu", verbose=False
         )[0]
     else:
-        base_area = max(1, H * W) if roi_rect is None else max(1, (roi_rect[3]-roi_rect[1])*(roi_rect[2]-roi_rect[0]))
+        base_area = max(1, H * W) if roi_rect is None else max(
+            1, (roi_rect[3]-roi_rect[1])*(roi_rect[2]-roi_rect[0])
+        )
         res = _yolo_model.predict(
             source=frame, imgsz=imgsz, conf=conf, iou=iou,
             max_det=50, device="cpu", verbose=False
@@ -404,10 +357,13 @@ def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
 
     for (x1, y1, x2, y2, conf_b, cls_id, label) in dets_target[:50]:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 0), 2)
-
         display_label = LABEL_DISPLAY.get(label.lower(), label)
-        cv2.putText(frame, f"{display_label} {conf_b:.2f}", (x1, max(12, y1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 0), 2, cv2.LINE_AA)
+        cv2.putText(
+            frame, f"{display_label} {conf_b:.2f}",
+            (x1, max(12, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+            (0, 215, 0), 2, cv2.LINE_AA
+        )
 
     if DEBUG_LOG and (counter % 15 == 0):
         print(f"[DEBUG] boxes={n_total} kept={len(dets_target)} drop(label/area/center)={drop_label}/{drop_area}/{drop_center}")
@@ -415,22 +371,22 @@ def _infer_and_draw(frame, counter, conf, iou, imgsz, min_area_ratio, roi_rect):
     return dets_target
 
 
-# ========= Util sumber video =========
+# ========= Open Source =========
 def _open_source(source: str, index: int, path: Optional[str]) -> cv2.VideoCapture:
-    """Buka VideoCapture untuk webcam atau file."""
     if source == "webcam":
         backend = CAP_MAP.get(CAM_BACKEND, cv2.CAP_ANY)
         cap0 = cv2.VideoCapture(index, backend)
         if not cap0.isOpened() and backend != cv2.CAP_ANY:
             cap0 = cv2.VideoCapture(index, cv2.CAP_ANY)
         return cap0
-    else:
-        if not path:
-            raise ValueError("path video kosong")
-        return cv2.VideoCapture(path)
+
+    # video / ipcam -> pakai path/url
+    if not path:
+        raise ValueError("path video/url kosong")
+    return cv2.VideoCapture(path)
 
 
-# ========= Capture loop =========
+# ========= Capture Loop =========
 def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=False):
     global cap, running, latest_jpeg, alert_status, last_alert_photo_ts
 
@@ -447,24 +403,21 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
         running = False
         return
 
-    # set resolusi untuk webcam
     if source == "webcam":
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     absent_hist = []
     missing_streak = 0
-    last_status = "NORMAL"
-    last_alert_ts = 0.0
     counter = 0
 
     roi_rect = None
     roi_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
+
     ok_first, frame0 = cap.read()
     if ok_first:
-        rr = get_roi_rect_pixels(frame0.shape)
-        if rr:
-            roi_rect = rr
+        roi_rect = get_roi_rect_pixels(frame0.shape)
+        if roi_rect:
             print("[ROI] aktif:", roi_rect)
     else:
         print("[CAM] frame pertama gagal")
@@ -475,7 +428,6 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
     while running:
         ok, frame = cap.read()
         if not ok:
-
             if source == "video" and loop_video:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
@@ -484,14 +436,15 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
 
         counter += 1
 
+        # reload ROI jika file berubah
         if counter % 30 == 0:
             new_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
             if new_mtime != roi_mtime:
                 roi_mtime = new_mtime
-                rr = get_roi_rect_pixels(frame.shape)
-                roi_rect = rr
+                roi_rect = get_roi_rect_pixels(frame.shape)
                 print("[ROI] reload:", roi_rect)
 
+        dets = []
         try:
             dets = _infer_and_draw(
                 frame=frame,
@@ -510,10 +463,7 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
             dets = []
 
         present_raw = len(dets) > 0
-        if present_raw:
-            missing_streak = 0
-        else:
-            missing_streak += 1
+        missing_streak = 0 if present_raw else (missing_streak + 1)
         present = True if present_raw or missing_streak <= PRESENT_GRACE else False
 
         absent_hist.append(0 if present else 1)
@@ -527,44 +477,21 @@ def capture_loop(source="webcam", index=0, path: Optional[str]=None, loop_video=
         elif avg_absent >= WARN_THRESHOLD:
             status_str = "WARN"
 
-        # Update alert status
         old_alert = alert_status
-        if status_str == "ALERT":
-            alert_status = "missing"
-        else:
-            alert_status = "present"
+        alert_status = "missing" if status_str == "ALERT" else "present"
 
-        # Kirim foto ke Telegram saat ALERT pertama kali
+        # kirim foto saat transisi ke ALERT
         if TG_TOKEN and TG_CHAT_ID and status_str == "ALERT" and old_alert != "missing":
             now = time.time()
             if now - last_alert_photo_ts > TG_COOLDOWN_S:
                 last_alert_photo_ts = now
-
-                # Encode frame ke JPG untuk dikirim
                 ok_jpg, jpg_buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                 if ok_jpg:
-                    jpg_bytes = jpg_buf.tobytes()
-                    send_telegram_photo(jpg_bytes, "⚠️ ALERT: Kotak infaq tidak terdeteksi!")
+                    send_telegram_photo(jpg_buf.tobytes(), "⚠️ ALERT: Kotak infaq tidak terdeteksi!")
 
-        # Gambar ROI rectangle
+        # gambar ROI
         if roi_rect:
             cv2.rectangle(frame, (roi_rect[0], roi_rect[1]), (roi_rect[2], roi_rect[3]), (255, 165, 0), 2)
-        color = (0, 255, 255) if status_str == "NORMAL" else ((0, 165, 255) if status_str == "WARN" else (0, 0, 255))
-        H, W = frame.shape[:2]
-        hud = f"Status: {status_str} | absent≈{avg_absent:.2f} | dets={len(dets)}"
-        font = cv2.FONT_HERSHEY_SIMPLEX; scale = 0.6; thickness = 2
-        (text_w, text_h), baseline = cv2.getTextSize(hud, font, scale, thickness)
-        pad_x = 12; pad_y = 8
-        x1 = 10; y2 = H - 10; x2 = x1 + text_w + pad_x * 2; y1 = y2 - (text_h + pad_y * 2)
-        if x2 > W - 10:
-            x2 = W - 10; x1 = max(10, x2 - (text_w + pad_x * 2))
-        x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        text_x = x1 + pad_x; text_y = y2 - pad_y - baseline
-        cv2.putText(frame, hud, (text_x, text_y + text_h - baseline), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-        last_status = status_str
 
         ok2, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         if ok2:
@@ -584,12 +511,13 @@ def mjpeg_gen():
         with lock:
             buf = latest_jpeg
         if buf is not None:
-            yield (b"--" + boundary.encode() + b"\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + buf + b"\r\n")
+            yield (
+                b"--" + boundary.encode() + b"\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buf + b"\r\n"
+            )
         time.sleep(0.02)
 
 
-# ========= API kamera =========
 # ========= API kamera =========
 @app.get("/camera/status")
 def get_camera_status():
@@ -611,21 +539,29 @@ def get_camera_status():
 
 @app.post("/camera/start")
 def start(
-    source: str = Query("webcam", pattern="^(webcam|video)$"),
+    source: str = Query("webcam", pattern="^(webcam|video|ipcam)$"),
     index: int = 0,
     path: Optional[str] = None,
     loop: bool = True,
 ):
     global running, CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP
+
     if running:
         return {"ok": True, "msg": "already running"}
+
+    # validasi minimal
+    if source in ("video", "ipcam") and not path:
+        raise HTTPException(400, "path wajib diisi untuk video/ipcam")
+
     CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP = source, index, path, loop
     running = True
+
     threading.Thread(
         target=capture_loop,
         kwargs={"source": source, "index": index, "path": path, "loop_video": loop},
-        daemon=True
+        daemon=True,
     ).start()
+
     return {"ok": True, "source": source, "index": index, "path": path, "loop": loop}
 
 

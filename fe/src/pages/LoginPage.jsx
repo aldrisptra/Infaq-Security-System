@@ -120,6 +120,12 @@ export default function LoginPage() {
         <p className="mt-4 text-[11px] text-slate-400 text-center">
           Gunakan akun admin yang sudah dibuat di database.
         </p>
+        <p className="mt-2 text-[11px] text-slate-400 text-center">
+          Belum punya akun?{" "}
+          <a href="/register" className="text-emerald-700 hover:underline">
+            Registrasi Masjid
+          </a>
+        </p>
       </div>
     </div>
   );

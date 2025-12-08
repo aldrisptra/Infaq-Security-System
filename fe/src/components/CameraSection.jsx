@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import RoiSelector from "./RoiSelector.jsx";
 import Header from "./Header.jsx";
@@ -6,23 +6,69 @@ import Header from "./Header.jsx";
 const API_BASE = "http://localhost:8000";
 
 export default function CameraSection() {
-  const [mode, setMode] = useState("video");
+  const navigate = useNavigate();
+
+  const [mode, setMode] = useState("webcam"); // webcam | video | ipcam
   const [videoPath, setVideoPath] = useState("sample/mesjid_kotak.mp4");
+  const [ipcamUrl, setIpcamUrl] = useState("");
+
   const [active, setActive] = useState(false);
   const [streamUrl, setStreamUrl] = useState("");
   const [statusText, setStatusText] = useState("");
   const [alertStatus, setAlertStatus] = useState(null);
   const [history, setHistory] = useState([]);
-  const navigate = useNavigate();
 
-  // Fetch camera status
+  const lastAlertRef = useRef(null);
+
+  // =========================
+  // Load default camera dari DB
+  // =========================
+  useEffect(() => {
+    const token = localStorage.getItem("authToken");
+    if (!token) {
+      navigate("/login", { replace: true });
+      return;
+    }
+
+    fetch(`${API_BASE}/camera/default`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json())
+      .then((cfg) => {
+        if (!cfg) return;
+
+        if (cfg.source === "ipcam") {
+          setMode("ipcam");
+          setIpcamUrl(cfg.path || "");
+        } else if (cfg.source === "video") {
+          setMode("video");
+          setVideoPath(cfg.path || "sample/mesjid_kotak.mp4");
+        } else {
+          setMode("webcam");
+        }
+      })
+      .catch(() => {});
+  }, [navigate]);
+
+  // =========================
+  // Polling status kamera
+  // =========================
   const refreshStatus = async () => {
     try {
       const response = await fetch(`${API_BASE}/camera/status`);
-      const { running, alert_status } = await response.json();
+      if (!response.ok) return;
 
-      // Deteksi perubahan status dan tambahkan ke history
-      if (alert_status && alert_status !== alertStatus) {
+      const data = await response.json();
+      const { running, alert_status } = data;
+
+      setActive(running);
+      setAlertStatus(alert_status);
+
+      // add history kalau status berubah
+      const last = lastAlertRef.current;
+      if (alert_status && alert_status !== last) {
+        lastAlertRef.current = alert_status;
+
         const newEvent = {
           id: Date.now(),
           status: alert_status,
@@ -33,52 +79,92 @@ export default function CameraSection() {
               : "✓ Kotak infaq terdeteksi",
         };
 
-        setHistory((prev) => [newEvent, ...prev].slice(0, 10)); // Simpan max 10 riwayat
+        setHistory((prev) => [newEvent, ...prev].slice(0, 10));
       }
 
-      setActive(running);
-      setAlertStatus(alert_status);
       if (running) {
         setStreamUrl(`${API_BASE}/camera/stream?ts=${Date.now()}`);
+      } else {
+        setStreamUrl("");
       }
-    } catch (error) {
-      setActive(false);
-      console.error("Failed to fetch status:", error);
+    } catch (err) {
+      // silent
     }
   };
 
   useEffect(() => {
     refreshStatus();
-    const interval = setInterval(refreshStatus, 2000);
-    return () => clearInterval(interval);
-  }, [alertStatus]);
+    const t = setInterval(refreshStatus, 1500);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
+  // =========================
+  // Start manual (sesuai mode)
+  // =========================
   const startCam = async () => {
     try {
+      setStatusText("");
+
       const params = new URLSearchParams();
 
       if (mode === "video") {
         params.append("source", "video");
         params.append("path", videoPath);
         params.append("loop", "true");
+      } else if (mode === "ipcam") {
+        if (!ipcamUrl) throw new Error("IP Camera URL masih kosong");
+        params.append("source", "ipcam");
+        params.append("path", ipcamUrl);
+        params.append("loop", "true");
       } else {
         params.append("source", "webcam");
+        params.append("index", "0");
       }
 
-      const response = await fetch(`${API_BASE}/camera/start?${params}`, {
+      const res = await fetch(`${API_BASE}/camera/start?${params.toString()}`, {
         method: "POST",
       });
 
-      if (!response.ok) {
-        throw new Error(await response.text());
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || "Gagal start kamera");
       }
 
-      setStreamUrl(`${API_BASE}/camera/stream?ts=${Date.now()}`);
       setActive(true);
+      setStreamUrl(`${API_BASE}/camera/stream?ts=${Date.now()}`);
+    } catch (err) {
+      setStatusText(`Gagal start: ${err.message}`);
+    }
+  };
+
+  // =========================
+  // Start dari default DB
+  // =========================
+  const startDefaultFromDb = async () => {
+    const token = localStorage.getItem("authToken");
+    if (!token) {
+      navigate("/login", { replace: true });
+      return;
+    }
+
+    try {
       setStatusText("");
-    } catch (error) {
-      setStatusText(`Gagal start: ${error.message}`);
-      console.error("Start camera error:", error);
+
+      const res = await fetch(`${API_BASE}/camera/start-default`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || "Gagal start default camera");
+      }
+
+      // refresh status & stream
+      await refreshStatus();
+    } catch (err) {
+      setStatusText(`Gagal start default: ${err.message}`);
     }
   };
 
@@ -89,42 +175,34 @@ export default function CameraSection() {
       setStreamUrl("");
       setStatusText("");
       setAlertStatus(null);
-    } catch (error) {
-      setStatusText(`Gagal stop: ${error.message}`);
-      console.error("Stop camera error:", error);
+      lastAlertRef.current = null;
+    } catch (err) {
+      setStatusText(`Gagal stop: ${err.message}`);
     }
   };
 
   const handleLogout = async () => {
     try {
-      // kalau kamera lagi aktif, kita stop dulu (biar rapi)
-      if (active) {
-        await stopCam();
-      }
-    } catch (e) {
-      console.error("Gagal stop kamera saat logout:", e);
-    }
+      if (active) await stopCam();
+    } catch (_) {}
 
-    // hapus token auth
     localStorage.removeItem("authToken");
-
-    // arahkan balik ke halaman login
     navigate("/login", { replace: true });
   };
 
-  const clearHistory = () => {
-    setHistory([]);
-  };
+  const clearHistory = () => setHistory([]);
 
+  // =========================
+  // UI
+  // =========================
   return (
     <div className="min-h-screen bg-emerald-900">
-      {/* Navbar + tombol Logout */}
       <Header onLogout={handleLogout} />
 
       <div className="max-w-7xl mx-auto">
         {/* Status Cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 py-6 px-4 sm:px-7">
-          {/* Camera Status Card */}
+          {/* Camera Status */}
           <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-blue-500">
             <div className="flex items-center justify-between">
               <div>
@@ -163,7 +241,7 @@ export default function CameraSection() {
             </div>
           </div>
 
-          {/* Box Status Card */}
+          {/* Box Status */}
           <div
             className={`bg-white rounded-xl shadow-lg p-6 border-l-4 ${
               alertStatus === "missing"
@@ -216,7 +294,7 @@ export default function CameraSection() {
             </div>
           </div>
 
-          {/* Alert Count Card */}
+          {/* Total Kejadian */}
           <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-emerald-700">
             <div className="flex items-center justify-between">
               <div>
@@ -245,37 +323,26 @@ export default function CameraSection() {
             </div>
           </div>
         </div>
-        {/* Main Content Grid */}
+
+        {/* Main Content */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 sm:px-7 px-4 pb-6">
-          {/* Left Column - Camera Feed */}
+          {/* Left */}
           <div className="lg:col-span-2 space-y-6">
-            {/* Controls Card */}
-            <div className="bg-white rounded-xl shadow-lg p-6 ">
+            {/* Controls */}
+            <div className="bg-white rounded-xl shadow-lg p-6">
               <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center">
-                <svg
-                  className="w-6 h-6 mr-2 text-blue-600"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"
-                  />
-                </svg>
-                Kontrol Kamera
+                <span className="mr-2">🎛️</span> Kontrol Kamera
               </h2>
 
               <div className="flex flex-wrap gap-3 items-center">
                 <select
                   value={mode}
                   onChange={(e) => setMode(e.target.value)}
-                  className="border border-gray-300 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  className="border border-gray-300 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
-                  <option value="video">📹 Video File</option>
                   <option value="webcam">🎥 Webcam</option>
+                  <option value="video">📹 Video File</option>
+                  <option value="ipcam">📱 IP Camera</option>
                 </select>
 
                 {mode === "video" && (
@@ -283,61 +350,42 @@ export default function CameraSection() {
                     type="text"
                     value={videoPath}
                     onChange={(e) => setVideoPath(e.target.value)}
-                    placeholder="path/to/video.mp4"
-                    className="flex-1 min-w-[300px] border border-gray-300 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    placeholder="sample/mesjid_kotak.mp4"
+                    className="flex-1 min-w-[280px] border border-gray-300 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                )}
+
+                {mode === "ipcam" && (
+                  <input
+                    type="text"
+                    value={ipcamUrl}
+                    onChange={(e) => setIpcamUrl(e.target.value)}
+                    placeholder="http://192.168.1.8:4747/video"
+                    className="flex-1 min-w-[280px] border border-gray-300 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
                 )}
 
                 {!active ? (
-                  <button
-                    onClick={startCam}
-                    className="px-6 py-2.5 bg-gradient-to-r from-blue-500 to-blue-600 text-white font-medium rounded-lg hover:from-blue-600 hover:to-blue-700 active:scale-95 transition-all shadow-md flex items-center gap-2"
-                  >
-                    <svg
-                      className="w-5 h-5"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
+                  <>
+                    <button
+                      onClick={startCam}
+                      className="px-6 py-2.5 bg-gradient-to-r from-teal-600 to-teal-700 text-white font-medium rounded-lg hover:from-teal-700 hover:to-teal-800 active:scale-95 transition-all shadow-md"
                     >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"
-                      />
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                      />
-                    </svg>
-                    Start Kamera
-                  </button>
+                      Start Kamera
+                    </button>
+                    <button
+                      onClick={startDefaultFromDb}
+                      className="px-5 py-2.5 bg-white border border-emerald-200 text-emerald-800 font-medium rounded-lg hover:bg-emerald-50 active:scale-95 transition-all"
+                      title="Ambil sumber kamera default dari database"
+                    >
+                      Start Default (DB)
+                    </button>
+                  </>
                 ) : (
                   <button
                     onClick={stopCam}
-                    className="px-6 py-2.5 bg-gradient-to-r from-red-500 to-red-600 text-white font-medium rounded-lg hover:from-red-600 hover:to-red-700 active:scale-95 transition-all shadow-md flex items-center gap-2"
+                    className="px-6 py-2.5 bg-gradient-to-r from-red-500 to-red-600 text-white font-medium rounded-lg hover:from-red-600 hover:to-red-700 active:scale-95 transition-all shadow-md"
                   >
-                    <svg
-                      className="w-5 h-5"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                      />
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"
-                      />
-                    </svg>
                     Stop Kamera
                   </button>
                 )}
@@ -345,95 +393,43 @@ export default function CameraSection() {
 
               {statusText && (
                 <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg">
-                  <p className="text-sm text-red-600 flex items-center gap-2">
-                    <svg
-                      className="w-4 h-4"
-                      fill="currentColor"
-                      viewBox="0 0 20 20"
-                    >
-                      <path
-                        fillRule="evenodd"
-                        d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
-                        clipRule="evenodd"
-                      />
-                    </svg>
-                    {statusText}
-                  </p>
+                  <p className="text-sm text-red-600">{statusText}</p>
                 </div>
               )}
             </div>
 
-            {/* Video Feed Card */}
+            {/* Video Feed */}
             <div className="bg-white rounded-xl shadow-lg p-6">
               <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center">
-                <svg
-                  className="w-6 h-6 mr-2 text-blue-600"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
-                  />
-                </svg>
-                Live Camera
+                <span className="mr-2">📡</span> Live Camera
               </h2>
 
               {active ? (
                 <RoiSelector streamUrl={streamUrl} apiBase={API_BASE} />
               ) : (
                 <div className="text-center py-20 bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg border-2 border-dashed border-gray-300">
-                  <svg
-                    className="w-16 h-16 mx-auto text-gray-400 mb-4"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
-                    />
-                  </svg>
                   <p className="text-gray-500 font-medium">
                     Kamera belum aktif
                   </p>
                   <p className="text-sm text-gray-400 mt-1">
-                    Klik "Start Kamera" untuk memulai monitoring
+                    Klik "Start Kamera" atau "Start Default (DB)"
                   </p>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Right Column - History */}
+          {/* Right - History */}
           <div className="lg:col-span-1">
             <div className="bg-white rounded-xl shadow-lg p-6 sticky top-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-xl font-bold text-gray-800 flex items-center">
-                  <svg
-                    className="w-6 h-6 mr-2 text-emerald-700"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-                    />
-                  </svg>
-                  Riwayat Kejadian
+                  <span className="mr-2">🕒</span> Riwayat Kejadian
                 </h2>
                 {history.length > 0 && (
                   <button
                     onClick={clearHistory}
-                    className="text-xs text-gray-500 hover:text-red-600 transition-colors"
+                    className="text-xs text-gray-500 hover:text-red-600"
                   >
                     Clear
                   </button>
@@ -442,20 +438,7 @@ export default function CameraSection() {
 
               <div className="space-y-3 max-h-[600px] overflow-y-auto pr-2">
                 {history.length === 0 ? (
-                  <div className="text-center py-12">
-                    <svg
-                      className="w-12 h-12 mx-auto text-gray-300 mb-3"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                      />
-                    </svg>
+                  <div className="text-center py-10">
                     <p className="text-sm text-gray-400">Belum ada kejadian</p>
                   </div>
                 ) : (
@@ -466,57 +449,20 @@ export default function CameraSection() {
                         event.status === "missing"
                           ? "bg-red-50 border-red-500"
                           : "bg-green-50 border-green-500"
-                      } transition-all hover:shadow-md`}
+                      }`}
                     >
-                      <div className="flex items-start gap-3">
-                        <div
-                          className={`p-2 rounded-full ${
-                            event.status === "missing"
-                              ? "bg-red-100"
-                              : "bg-green-100"
-                          }`}
-                        >
-                          {event.status === "missing" ? (
-                            <svg
-                              className="w-4 h-4 text-red-600"
-                              fill="currentColor"
-                              viewBox="0 0 20 20"
-                            >
-                              <path
-                                fillRule="evenodd"
-                                d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
-                                clipRule="evenodd"
-                              />
-                            </svg>
-                          ) : (
-                            <svg
-                              className="w-4 h-4 text-green-600"
-                              fill="currentColor"
-                              viewBox="0 0 20 20"
-                            >
-                              <path
-                                fillRule="evenodd"
-                                d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z"
-                                clipRule="evenodd"
-                              />
-                            </svg>
-                          )}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p
-                            className={`text-sm font-medium ${
-                              event.status === "missing"
-                                ? "text-red-800"
-                                : "text-green-800"
-                            }`}
-                          >
-                            {event.message}
-                          </p>
-                          <p className="text-xs text-gray-500 mt-1">
-                            {event.timestamp}
-                          </p>
-                        </div>
-                      </div>
+                      <p
+                        className={`text-sm font-medium ${
+                          event.status === "missing"
+                            ? "text-red-800"
+                            : "text-green-800"
+                        }`}
+                      >
+                        {event.message}
+                      </p>
+                      <p className="text-xs text-gray-500 mt-1">
+                        {event.timestamp}
+                      </p>
                     </div>
                   ))
                 )}

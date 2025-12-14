@@ -1,9 +1,9 @@
+// src/pages/CameraSection.jsx
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import RoiSelector from "./RoiSelector.jsx";
 import Header from "./Header.jsx";
-
-const API_BASE = "http://localhost:8000";
+import { apiFetch, API_BASE, clearToken, getToken } from "../lib/Api.js";
 
 export default function CameraSection() {
   const navigate = useNavigate();
@@ -20,21 +20,17 @@ export default function CameraSection() {
 
   const lastAlertRef = useRef(null);
 
-  // =========================
-  // Load default camera dari DB
-  // =========================
+  // ===== load default camera dari DB (butuh auth) =====
   useEffect(() => {
-    const token = localStorage.getItem("authToken");
+    const token = getToken();
     if (!token) {
       navigate("/login", { replace: true });
       return;
     }
 
-    fetch(`${API_BASE}/camera/default`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-      .then((r) => r.json())
-      .then((cfg) => {
+    (async () => {
+      try {
+        const cfg = await apiFetch("/camera/default", { auth: true });
         if (!cfg) return;
 
         if (cfg.source === "ipcam") {
@@ -46,29 +42,28 @@ export default function CameraSection() {
         } else {
           setMode("webcam");
         }
-      })
-      .catch(() => {});
+      } catch (err) {
+        // kalau token invalid/expired
+        if (err.status === 401) {
+          clearToken();
+          navigate("/login", { replace: true });
+        }
+      }
+    })();
   }, [navigate]);
 
-  // =========================
-  // Polling status kamera
-  // =========================
+  // ===== polling status (boleh public, tapi kita kirim auth juga aman) =====
   const refreshStatus = async () => {
     try {
-      const response = await fetch(`${API_BASE}/camera/status`);
-      if (!response.ok) return;
-
-      const data = await response.json();
+      const data = await apiFetch("/camera/status", { auth: true });
       const { running, alert_status } = data;
 
-      setActive(running);
+      setActive(!!running);
       setAlertStatus(alert_status);
 
-      // add history kalau status berubah
       const last = lastAlertRef.current;
       if (alert_status && alert_status !== last) {
         lastAlertRef.current = alert_status;
-
         const newEvent = {
           id: Date.now(),
           status: alert_status,
@@ -78,17 +73,17 @@ export default function CameraSection() {
               ? "⚠️ Kotak infaq tidak terdeteksi!"
               : "✓ Kotak infaq terdeteksi",
         };
-
         setHistory((prev) => [newEvent, ...prev].slice(0, 10));
       }
 
-      if (running) {
-        setStreamUrl(`${API_BASE}/camera/stream?ts=${Date.now()}`);
-      } else {
-        setStreamUrl("");
-      }
+      if (running) setStreamUrl(`${API_BASE}/camera/stream?ts=${Date.now()}`);
+      else setStreamUrl("");
     } catch (err) {
-      // silent
+      // kalau auth gagal
+      if (err.status === 401) {
+        clearToken();
+        navigate("/login", { replace: true });
+      }
     }
   };
 
@@ -99,9 +94,7 @@ export default function CameraSection() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // =========================
-  // Start manual (sesuai mode)
-  // =========================
+  // ===== start manual (WAJIB auth) =====
   const startCam = async () => {
     try {
       setStatusText("");
@@ -122,55 +115,33 @@ export default function CameraSection() {
         params.append("index", "0");
       }
 
-      const res = await fetch(`${API_BASE}/camera/start?${params.toString()}`, {
+      await apiFetch(`/camera/start?${params.toString()}`, {
         method: "POST",
+        auth: true,
       });
 
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(txt || "Gagal start kamera");
-      }
-
-      setActive(true);
-      setStreamUrl(`${API_BASE}/camera/stream?ts=${Date.now()}`);
+      await refreshStatus();
     } catch (err) {
       setStatusText(`Gagal start: ${err.message}`);
     }
   };
 
-  // =========================
-  // Start dari default DB
-  // =========================
+  // ===== start dari default DB =====
   const startDefaultFromDb = async () => {
-    const token = localStorage.getItem("authToken");
-    if (!token) {
-      navigate("/login", { replace: true });
-      return;
-    }
-
     try {
       setStatusText("");
-
-      const res = await fetch(`${API_BASE}/camera/start-default`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      });
-
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(txt || "Gagal start default camera");
-      }
-
-      // refresh status & stream
+      await apiFetch("/camera/start-default", { method: "POST", auth: true });
       await refreshStatus();
     } catch (err) {
       setStatusText(`Gagal start default: ${err.message}`);
     }
   };
 
+  // ===== stop (biasanya auth) =====
   const stopCam = async () => {
     try {
-      await fetch(`${API_BASE}/camera/stop`, { method: "POST" });
+      await apiFetch("/camera/stop", { method: "POST", auth: true });
+
       setActive(false);
       setStreamUrl("");
       setStatusText("");
@@ -185,16 +156,12 @@ export default function CameraSection() {
     try {
       if (active) await stopCam();
     } catch (_) {}
-
-    localStorage.removeItem("authToken");
+    clearToken();
     navigate("/login", { replace: true });
   };
 
   const clearHistory = () => setHistory([]);
 
-  // =========================
-  // UI
-  // =========================
   return (
     <div className="min-h-screen bg-emerald-900">
       <Header onLogout={handleLogout} />
@@ -216,27 +183,6 @@ export default function CameraSection() {
                 >
                   {active ? "Aktif" : "Nonaktif"}
                 </p>
-              </div>
-              <div
-                className={`p-3 rounded-full ${
-                  active ? "bg-emerald-100" : "bg-gray-100"
-                }`}
-              >
-                <svg
-                  className={`w-8 h-8 ${
-                    active ? "text-emerald-700" : "text-gray-400"
-                  }`}
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
-                  />
-                </svg>
               </div>
             </div>
           </div>
@@ -268,29 +214,6 @@ export default function CameraSection() {
                     : "-"}
                 </p>
               </div>
-              <div
-                className={`p-3 rounded-full ${
-                  alertStatus === "missing" ? "bg-red-100" : "bg-emerald-100"
-                }`}
-              >
-                <svg
-                  className={`w-8 h-8 ${
-                    alertStatus === "missing"
-                      ? "text-red-600"
-                      : "text-emerald-700"
-                  }`}
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"
-                  />
-                </svg>
-              </div>
             </div>
           </div>
 
@@ -305,21 +228,6 @@ export default function CameraSection() {
                   {history.length}
                 </p>
               </div>
-              <div className="p-3 rounded-full bg-emerald-100">
-                <svg
-                  className="w-8 h-8 text-emerald-700"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                  />
-                </svg>
-              </div>
             </div>
           </div>
         </div>
@@ -330,8 +238,8 @@ export default function CameraSection() {
           <div className="lg:col-span-2 space-y-6">
             {/* Controls */}
             <div className="bg-white rounded-xl shadow-lg p-6">
-              <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center">
-                <span className="mr-2">🎛️</span> Kontrol Kamera
+              <h2 className="text-xl font-bold text-gray-800 mb-4">
+                🎛️ Kontrol Kamera
               </h2>
 
               <div className="flex flex-wrap gap-3 items-center">
@@ -350,7 +258,6 @@ export default function CameraSection() {
                     type="text"
                     value={videoPath}
                     onChange={(e) => setVideoPath(e.target.value)}
-                    placeholder="sample/mesjid_kotak.mp4"
                     className="flex-1 min-w-[280px] border border-gray-300 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
                 )}
@@ -373,6 +280,7 @@ export default function CameraSection() {
                     >
                       Start Kamera
                     </button>
+
                     <button
                       onClick={startDefaultFromDb}
                       className="px-5 py-2.5 bg-white border border-emerald-200 text-emerald-800 font-medium rounded-lg hover:bg-emerald-50 active:scale-95 transition-all"
@@ -400,8 +308,8 @@ export default function CameraSection() {
 
             {/* Video Feed */}
             <div className="bg-white rounded-xl shadow-lg p-6">
-              <h2 className="text-xl font-bold text-gray-800 mb-4 flex items-center">
-                <span className="mr-2">📡</span> Live Camera
+              <h2 className="text-xl font-bold text-gray-800 mb-4">
+                📡 Live Camera
               </h2>
 
               {active ? (
@@ -423,8 +331,8 @@ export default function CameraSection() {
           <div className="lg:col-span-1">
             <div className="bg-white rounded-xl shadow-lg p-6 sticky top-6">
               <div className="flex items-center justify-between mb-4">
-                <h2 className="text-xl font-bold text-gray-800 flex items-center">
-                  <span className="mr-2">🕒</span> Riwayat Kejadian
+                <h2 className="text-xl font-bold text-gray-800">
+                  🕒 Riwayat Kejadian
                 </h2>
                 {history.length > 0 && (
                   <button

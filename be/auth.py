@@ -60,9 +60,7 @@ class RegisterMasjidRequest(BaseModel):
     password: str = Field(min_length=6, max_length=60)
 
 
-# =========================
 # HELPERS
-# =========================
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + (

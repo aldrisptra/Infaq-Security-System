@@ -1,11 +1,11 @@
-# database.py
 import os
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from urllib.parse import quote_plus
+from pathlib import Path
 
-load_dotenv()  # akan cari file .env di folder project
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "3306")

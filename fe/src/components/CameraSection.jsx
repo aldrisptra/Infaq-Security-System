@@ -1,4 +1,3 @@
-// src/pages/CameraSection.jsx
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import RoiSelector from "./RoiSelector.jsx";

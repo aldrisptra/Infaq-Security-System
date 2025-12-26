@@ -14,7 +14,12 @@ function RequireAuth({ children }) {
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter
+      future={{
+        v7_startTransition: true,
+        v7_relativeSplatPath: true,
+      }}
+    >
       <Routes>
         {/* default redirect ke /camera */}
         <Route path="/" element={<Navigate to="/camera" replace />} />

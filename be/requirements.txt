@@ -1,0 +1,7 @@
+fastapi==0.121.1
+uvicorn[standard]==0.38.0
+python-dotenv==1.2.1
+python-multipart==0.0.20
+PyJWT==2.10.1
+requests==2.32.5
+sqlalchemy==2.0.20

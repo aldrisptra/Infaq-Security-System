@@ -17,8 +17,19 @@ import requests
 # ============================================================
 # Railway (dashboard saja): set ENABLE_CAPTURE=0, ENABLE_YOLO=0
 # Edge/laptop (deteksi beneran): set ENABLE_CAPTURE=1, ENABLE_YOLO=1
-ENABLE_CAPTURE = os.getenv("ENABLE_CAPTURE", "0") == "1"
-ENABLE_YOLO = os.getenv("ENABLE_YOLO", "0") == "1"
+def env_flag(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
+
+# Default: Railway OFF, Lokal ON
+ENABLE_CAPTURE = env_flag("ENABLE_CAPTURE", default=(not IS_RAILWAY))
+ENABLE_YOLO    = env_flag("ENABLE_YOLO",    default=(not IS_RAILWAY))
+
 
 # Try import cv2/numpy (kalau tidak ada di cloud, jangan crash)
 try:
@@ -154,6 +165,18 @@ def debug_env():
         "ENABLE_CAPTURE": os.getenv("ENABLE_CAPTURE"),
         "ENABLE_YOLO": os.getenv("ENABLE_YOLO"),
     }
+
+@app.get("/debug/railway")
+def debug_railway():
+    return {
+        "RAILWAY_ENVIRONMENT": os.getenv("RAILWAY_ENVIRONMENT"),
+        "RAILWAY_PROJECT_ID": os.getenv("RAILWAY_PROJECT_ID"),
+        "RAILWAY_SERVICE_ID": os.getenv("RAILWAY_SERVICE_ID"),
+        "PORT": os.getenv("PORT"),
+        "ENABLE_CAPTURE": os.getenv("ENABLE_CAPTURE"),
+        "ENABLE_YOLO": os.getenv("ENABLE_YOLO"),
+    }
+
 
 
 @app.get("/")

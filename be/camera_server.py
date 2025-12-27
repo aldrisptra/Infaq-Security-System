@@ -13,10 +13,8 @@ import requests
 
 
 # ============================================================
-# MODE SWITCH (biar Railway aman, Edge tetap full)
+# MODE SWITCH (Railway aman, Edge tetap full)
 # ============================================================
-# Railway (dashboard saja): set ENABLE_CAPTURE=0, ENABLE_YOLO=0
-# Edge/laptop (deteksi beneran): set ENABLE_CAPTURE=1, ENABLE_YOLO=1
 def env_flag(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -31,7 +29,9 @@ ENABLE_CAPTURE = env_flag("ENABLE_CAPTURE", default=(not IS_RAILWAY))
 ENABLE_YOLO    = env_flag("ENABLE_YOLO",    default=(not IS_RAILWAY))
 
 
-# Try import cv2/numpy (kalau tidak ada di cloud, jangan crash)
+# ============================================================
+# Optional heavy imports (cv2/numpy/ultralytics)
+# ============================================================
 try:
     import cv2
 except Exception:
@@ -42,7 +42,6 @@ try:
 except Exception:
     np = None
 
-# Try import ultralytics (kalau tidak ada di cloud, jangan crash)
 try:
     from ultralytics import YOLO
 except Exception:
@@ -50,11 +49,11 @@ except Exception:
 
 
 # ============================================================
-# Optional imports (auth/db/models)
+# Optional imports (dotenv/auth/db/models)
 # ============================================================
 BASE_DIR = Path(__file__).resolve().parent
 
-# dotenv optional
+# dotenv optional (JANGAN override env Railway)
 try:
     from dotenv import load_dotenv
     load_dotenv(BASE_DIR / ".env", override=False)
@@ -75,12 +74,18 @@ try:
     from models import Camera as _Camera, Masjid as _Masjid
     Camera, Masjid = _Camera, _Masjid
 except Exception:
-    # biar cloud tetap bisa jalan tanpa DB
     pass
+
+def _get_db_none():
+    # Dependency fallback agar FastAPI tidak membuat "db" jadi query param
+    return None
+
+DB_DEP = get_db if get_db else _get_db_none
 
 # Auth optional
 auth_router = None
 CurrentUser = Any
+
 def _dummy_user():
     class U:
         id_masjid = 1
@@ -97,12 +102,11 @@ try:
     get_current_user = _get_current_user
     CurrentUser = _CurrentUser
 except Exception:
-    # fallback no-auth
     pass
 
 
 # ============================================================
-# ENV
+# ENV / CONFIG
 # ============================================================
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
 
@@ -126,7 +130,7 @@ DEBUG_LOG = os.getenv("DEBUG_LOG", "1") == "1"
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").strip()
 allow_origins = ["*"] if CORS_ORIGINS == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 
-# YOLO weights (edge biasanya lokal, cloud biasanya off)
+# YOLO weights (edge biasanya lokal)
 DEFAULT_WEIGHT = BASE_DIR / "best.pt"
 ALT_WEIGHT = BASE_DIR / "runs" / "detect" / "train_box" / "weights" / "best.pt"
 if (not DEFAULT_WEIGHT.is_file()) and ALT_WEIGHT.is_file():
@@ -164,6 +168,8 @@ def debug_env():
     return {
         "ENABLE_CAPTURE": os.getenv("ENABLE_CAPTURE"),
         "ENABLE_YOLO": os.getenv("ENABLE_YOLO"),
+        "computed_enable_capture": ENABLE_CAPTURE,
+        "computed_enable_yolo": ENABLE_YOLO,
     }
 
 @app.get("/debug/railway")
@@ -177,8 +183,6 @@ def debug_railway():
         "ENABLE_YOLO": os.getenv("ENABLE_YOLO"),
     }
 
-
-
 @app.get("/")
 def root():
     return {
@@ -189,6 +193,8 @@ def root():
         "cv2": bool(cv2),
         "ultralytics": bool(YOLO),
         "token_loaded": bool(TG_TOKEN),
+        "db_available": bool(get_db),
+        "auth_available": bool(auth_router),
     }
 
 
@@ -272,7 +278,6 @@ def clear_roi(current_user: CurrentUser = Depends(get_current_user)):
 def tg_send_text(chat_id: str, text: str):
     if not TG_TOKEN or not chat_id:
         return {"ok": False, "reason": "token/chat_id kosong"}
-
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=20)
     if r.status_code != 200:
@@ -282,24 +287,19 @@ def tg_send_text(chat_id: str, text: str):
 
 def tg_send_photo(chat_id: str, jpg_bytes: bytes, caption: str):
     if not TG_TOKEN or not chat_id:
-        print("[TG] skip: token/chat_id kosong")
         return {"ok": False, "reason": "token/chat_id kosong"}
-
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
     files = {"photo": ("capture.jpg", jpg_bytes, "image/jpeg")}
     data = {"chat_id": chat_id, "caption": caption}
     r = requests.post(url, data=data, files=files, timeout=20)
-
     if r.status_code != 200:
         print("[TG] sendPhoto ERROR", r.status_code, r.text)
         return {"ok": False, "status": r.status_code, "text": r.text}
-
-    print("[TG] OK sendPhoto to", chat_id)
     return {"ok": True}
 
 
 # ============================================================
-# DB Helpers (optional)
+# DB Helpers
 # ============================================================
 def _open_thread_db_session():
     if get_db is None:
@@ -368,7 +368,6 @@ def maybe_send_alert_photo(db: Session, camera_id: Optional[int], masjid_id: Opt
         target = get_tg_target_by_camera_id(db, camera_id)
     if (not target) and masjid_id:
         target = get_tg_target_by_masjid_id(db, masjid_id)
-
     if not target:
         return
 
@@ -390,24 +389,23 @@ def maybe_send_alert_photo(db: Session, camera_id: Optional[int], masjid_id: Opt
         last_alert_ts_by_masjid[mid] = now
 
 
-# Debug TG endpoints (biar cepat cek)
+# Debug TG endpoints
 @app.get("/debug/tg/me")
-def debug_tg_me(current_user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db) if get_db else None):
+def debug_tg_me(current_user: CurrentUser = Depends(get_current_user), db: Session = Depends(DB_DEP)):
     if db is None:
         return {"ok": False, "msg": "DB belum tersedia di mode cloud"}
     target = get_tg_target_by_masjid_id(db, current_user.id_masjid)
-    return {"masjid_id": current_user.id_masjid, "target": target, "token_loaded": bool(TG_TOKEN)}
+    return {"ok": True, "masjid_id": current_user.id_masjid, "target": target, "token_loaded": bool(TG_TOKEN)}
 
 @app.post("/debug/tg/test")
-def debug_tg_test(current_user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db) if get_db else None):
+def debug_tg_test(current_user: CurrentUser = Depends(get_current_user), db: Session = Depends(DB_DEP)):
     if db is None:
         return {"ok": False, "msg": "DB belum tersedia di mode cloud"}
     target = get_tg_target_by_masjid_id(db, current_user.id_masjid)
     if not target:
         return {"ok": False, "msg": "tg_chat_id kosong / masjid tidak ditemukan"}
-
     res = tg_send_text(target["chat_id"], f"✅ TEST NOTIF untuk masjid_id={target['id_masjid']}")
-    return {"target": target, "send_result": res}
+    return {"ok": True, "target": target, "send_result": res}
 
 
 # ============================================================
@@ -425,7 +423,6 @@ def matches_target(cls_id: int, label: str) -> bool:
 
 def ensure_model():
     global _yolo_model, _model_names
-
     if not ENABLE_YOLO:
         return
     if YOLO is None:
@@ -435,10 +432,9 @@ def ensure_model():
 
     wp = Path(YOLO_WEIGHTS)
     if not wp.is_file():
-        raise FileNotFoundError(f"YOLO_WEIGHTS tidak ditemukan: {wp} (karena best.pt gitignore, ini normal di cloud)")
+        raise FileNotFoundError(f"YOLO_WEIGHTS tidak ditemukan: {wp}")
 
     _yolo_model = YOLO(str(wp))
-    # paksa CPU (stabil untuk edge demo)
     try:
         _yolo_model.to("cpu")
     except Exception:
@@ -447,11 +443,8 @@ def ensure_model():
     print("[YOLO] loaded:", wp)
 
 def infer_and_draw(frame, counter: int, roi_rect):
-    if not ENABLE_YOLO:
+    if not ENABLE_YOLO or _yolo_model is None:
         return []
-    if _yolo_model is None:
-        return []
-
     if counter % INFER_EVERY != 0:
         return []
 
@@ -463,24 +456,14 @@ def infer_and_draw(frame, counter: int, roi_rect):
         crop = frame[ry1:ry2, rx1:rx2]
         base_area = max(1, (ry2 - ry1) * (rx2 - rx1))
         res = _yolo_model.predict(
-            source=crop,
-            imgsz=YOLO_IMG_DEF,
-            conf=YOLO_CONF_DEF,
-            iou=YOLO_IOU_DEF,
-            max_det=50,
-            device="cpu",
-            verbose=False,
+            source=crop, imgsz=YOLO_IMG_DEF, conf=YOLO_CONF_DEF, iou=YOLO_IOU_DEF,
+            max_det=50, device="cpu", verbose=False
         )[0]
     else:
-        base_area = max(1, H * W) if roi_rect is None else max(1, (roi_rect[3]-roi_rect[1])*(roi_rect[2]-roi_rect[0]))
+        base_area = max(1, H * W)
         res = _yolo_model.predict(
-            source=frame,
-            imgsz=YOLO_IMG_DEF,
-            conf=YOLO_CONF_DEF,
-            iou=YOLO_IOU_DEF,
-            max_det=50,
-            device="cpu",
-            verbose=False,
+            source=frame, imgsz=YOLO_IMG_DEF, conf=YOLO_CONF_DEF, iou=YOLO_IOU_DEF,
+            max_det=50, device="cpu", verbose=False
         )[0]
 
     dets = []
@@ -495,7 +478,7 @@ def infer_and_draw(frame, counter: int, roi_rect):
         x1, y1, x2, y2 = [int(v) for v in b.xyxy[0]]
         cls_id = int(b.cls[0]) if b.cls is not None else -1
 
-        if use_crop:
+        if use_crop and roi_rect:
             x1 += rx1; x2 += rx1
             y1 += ry1; y2 += ry1
 
@@ -525,20 +508,11 @@ def infer_and_draw(frame, counter: int, roi_rect):
     for (x1, y1, x2, y2, conf_b, cls_id, label) in dets[:50]:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 0), 2)
         show = LABEL_DISPLAY.get(label.lower(), label)
-        cv2.putText(
-            frame,
-            f"{show} {conf_b:.2f}",
-            (x1, max(12, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 215, 0),
-            2,
-            cv2.LINE_AA,
-        )
+        cv2.putText(frame, f"{show} {conf_b:.2f}", (x1, max(12, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 0), 2, cv2.LINE_AA)
 
     if DEBUG_LOG and counter % 30 == 0:
         print(f"[DEBUG] dets kept={len(dets)}")
-
     return dets
 
 
@@ -566,16 +540,13 @@ CUR_MASJID_ID: Optional[int] = None
 # ============================================================
 def open_source(source: str, index: int, path: Optional[str]):
     if cv2 is None:
-        raise RuntimeError("OpenCV belum terpasang. Install opencv-python / opencv-python-headless")
+        raise RuntimeError("OpenCV belum terpasang.")
 
     if source == "webcam":
-        # di edge Windows bisa pakai backend DSHOW kalau mau, tapi biarkan default dulu
-        cap0 = cv2.VideoCapture(index)
-        return cap0
+        return cv2.VideoCapture(index)
 
     if not path:
         raise ValueError("path video/url kosong")
-    # ipcam/video sama-sama lewat path
     return cv2.VideoCapture(path)
 
 def reopen_capture(source: str, index: int, path: Optional[str], sleep_s: float = 1.0):
@@ -583,7 +554,8 @@ def reopen_capture(source: str, index: int, path: Optional[str], sleep_s: float 
         c = open_source(source, index, path)
         if c is None or not c.isOpened():
             try:
-                if c: c.release()
+                if c:
+                    c.release()
             except Exception:
                 pass
             time.sleep(sleep_s)
@@ -613,26 +585,22 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
 
     db, gen = _open_thread_db_session()
     try:
-        # YOLO: jangan bikin cloud crash, tapi di edge wajib ada
+        # YOLO: edge wajib kalau ENABLE_YOLO true
         try:
             ensure_model()
         except Exception as e:
             print("[YOLO] ensure_model error:", e)
-            # kalau YOLO dimatikan, masih boleh streaming kamera tanpa deteksi
             if ENABLE_YOLO:
                 running = False
                 return
 
-        # open capture dengan auto-reconnect
         cap = reopen_capture(source, index, path, sleep_s=1.0)
         if cap is None:
-            print("[CAM] gagal buka source", source, index, path)
             running = False
             return
 
         ok0, frame0 = cap.read()
         if not ok0:
-            print("[CAM] frame pertama gagal, coba reconnect")
             try:
                 cap.release()
             except Exception:
@@ -659,35 +627,31 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             if not ok:
                 fail_read_streak += 1
 
-                # video loop
                 if source == "video" and loop_video and fail_read_streak >= 2:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     fail_read_streak = 0
                     time.sleep(0.02)
                     continue
 
-                # reconnect untuk ipcam/droidcam
                 if fail_read_streak >= 15:
-                    print("[CAM] read fail streak -> reconnect", fail_read_streak)
                     try:
                         cap.release()
                     except Exception:
                         pass
                     cap = reopen_capture(source, index, path, sleep_s=1.0)
                     fail_read_streak = 0
+
                 time.sleep(0.02)
                 continue
 
             fail_read_streak = 0
             counter += 1
 
-            # reload ROI kalau file berubah
             if counter % 30 == 0:
                 new_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
                 if new_mtime != roi_mtime:
                     roi_mtime = new_mtime
                     roi = roi_rect_px(frame.shape)
-                    print("[ROI] reload:", roi)
 
             dets = []
             if ENABLE_YOLO and _yolo_model is not None:
@@ -696,7 +660,7 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             if REQUIRE_ROI and roi is None:
                 dets = []
 
-            present_raw = len(dets) > 0 if ENABLE_YOLO else True
+            present_raw = (len(dets) > 0) if ENABLE_YOLO else True
             missing_streak = 0 if present_raw else (missing_streak + 1)
             present = True if present_raw or missing_streak <= PRESENT_GRACE else False
 
@@ -715,11 +679,9 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             old_alert = alert_status
             alert_status = "missing" if status_str == "ALERT" else "present"
 
-            # send TG only on transition to ALERT
             if TG_TOKEN and status_str == "ALERT" and old_alert != "missing":
                 maybe_send_alert_photo(db, camera_id, masjid_id, frame)
 
-            # draw ROI
             if roi:
                 cv2.rectangle(frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 165, 0), 2)
 
@@ -774,9 +736,12 @@ def camera_status():
     }
 
 @app.get("/camera/default")
-def camera_default(current_user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db) if get_db else None):
+def camera_default(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(DB_DEP),
+):
     if db is None:
-        # cloud demo fallback
+        # cloud fallback
         return {"source": "ipcam", "index": 0, "path": None, "loop": True, "camera_id": None, "camera_name": None}
 
     cam = get_latest_camera_for_masjid(db, current_user.id_masjid)
@@ -793,10 +758,12 @@ def camera_default(current_user: CurrentUser = Depends(get_current_user), db: Se
     }
 
 @app.post("/camera/start-default")
-def start_default(current_user: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db) if get_db else None):
+def start_default(
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(DB_DEP),
+):
     if not ENABLE_CAPTURE:
         raise HTTPException(503, "Capture disabled (cloud mode)")
-
     if db is None:
         raise HTTPException(503, "DB belum tersedia")
 
@@ -825,7 +792,7 @@ def start_camera(
     loop: bool = True,
     camera_id: Optional[int] = None,
     current_user: CurrentUser = Depends(get_current_user),
-    db: Session = Depends(get_db) if get_db else None,
+    db: Session = Depends(DB_DEP),
 ):
     global running, CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP, CUR_CAMERA_ID, CUR_MASJID_ID
 

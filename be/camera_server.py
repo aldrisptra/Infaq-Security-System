@@ -17,8 +17,8 @@ import requests
 # ============================================================
 # Railway (dashboard saja): set ENABLE_CAPTURE=0, ENABLE_YOLO=0
 # Edge/laptop (deteksi beneran): set ENABLE_CAPTURE=1, ENABLE_YOLO=1
-ENABLE_CAPTURE = os.getenv("ENABLE_CAPTURE", "1") == "1"
-ENABLE_YOLO = os.getenv("ENABLE_YOLO", "1") == "1"
+ENABLE_CAPTURE = os.getenv("ENABLE_CAPTURE", "0") == "1"
+ENABLE_YOLO = os.getenv("ENABLE_YOLO", "0") == "1"
 
 # Try import cv2/numpy (kalau tidak ada di cloud, jangan crash)
 try:
@@ -147,6 +147,13 @@ app.add_middleware(
 
 if auth_router is not None:
     app.include_router(auth_router)
+
+@app.get("/debug/env")
+def debug_env():
+    return {
+        "ENABLE_CAPTURE": os.getenv("ENABLE_CAPTURE"),
+        "ENABLE_YOLO": os.getenv("ENABLE_YOLO"),
+    }
 
 
 @app.get("/")

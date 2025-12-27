@@ -1,29 +1,27 @@
 // src/lib/Api.js
 
-// Base URL backend (ambil dari Netlify env: VITE_API_BASE)
 export const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(
   /\/$/,
   ""
 );
+export const EDGE_BASE = (import.meta.env.VITE_EDGE_BASE || "").replace(
+  /\/$/,
+  ""
+);
 
-// Token helpers
 export function getToken() {
   return localStorage.getItem("authToken");
 }
-
 export function setToken(token) {
   localStorage.setItem("authToken", token);
 }
-
 export function clearToken() {
   localStorage.removeItem("authToken");
 }
 
-// Response parser
 async function parseBody(res) {
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) return await res.json();
-
   const text = await res.text();
   try {
     return JSON.parse(text);
@@ -32,21 +30,14 @@ async function parseBody(res) {
   }
 }
 
-/**
- * apiFetch("/auth/login", { method: "POST", body: ..., headers: ... })
- * apiFetch("/camera/status", { auth: true })
- *
- * options.auth = true -> otomatis pasang Authorization: Bearer <token>
- */
-export async function apiFetch(path, options = {}) {
-  const { auth = false, headers = {}, ...rest } = options;
-
-  if (!API_BASE) {
-    const err = new Error("VITE_API_BASE belum diset");
-    err.status = 500;
-    throw err;
+async function baseFetch(base, path, options = {}) {
+  if (!base) {
+    throw new Error(
+      "Base URL kosong. Cek VITE_API_BASE / VITE_EDGE_BASE di environment Netlify."
+    );
   }
 
+  const { auth = false, headers = {}, ...rest } = options;
   const finalHeaders = { ...headers };
 
   if (auth) {
@@ -59,14 +50,7 @@ export async function apiFetch(path, options = {}) {
     finalHeaders.Authorization = `Bearer ${token}`;
   }
 
-  // rapihin path biar aman (boleh kirim "auth/login" atau "/auth/login")
-  const cleanPath = path.startsWith("/") ? path : `/${path}`;
-
-  const res = await fetch(`${API_BASE}${cleanPath}`, {
-    ...rest,
-    headers: finalHeaders,
-  });
-
+  const res = await fetch(`${base}${path}`, { ...rest, headers: finalHeaders });
   const data = await parseBody(res);
 
   if (!res.ok) {
@@ -82,4 +66,14 @@ export async function apiFetch(path, options = {}) {
   }
 
   return data;
+}
+
+// AUTH / DB (Railway)
+export function apiFetch(path, options) {
+  return baseFetch(API_BASE, path, options);
+}
+
+// CAMERA / ROI / STREAM (Edge/Laptop)
+export function edgeFetch(path, options) {
+  return baseFetch(EDGE_BASE, path, options);
 }

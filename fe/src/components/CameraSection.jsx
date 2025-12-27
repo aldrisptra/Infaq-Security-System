@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import RoiSelector from "./RoiSelector.jsx";
 import Header from "./Header.jsx";
-import { apiFetch, API_BASE, clearToken, getToken } from "../lib/Api.js";
+import { edgeFetch, EDGE_BASE, clearToken, getToken } from "../lib/Api.js";
 
 export default function CameraSection() {
   const navigate = useNavigate();
@@ -29,7 +29,7 @@ export default function CameraSection() {
 
     (async () => {
       try {
-        const cfg = await apiFetch("/camera/default", { auth: true });
+        const cfg = await edgeFetch("/camera/default", { auth: true });
         if (!cfg) return;
 
         if (cfg.source === "ipcam") {
@@ -54,7 +54,7 @@ export default function CameraSection() {
   // ===== polling status (boleh public, tapi kita kirim auth juga aman) =====
   const refreshStatus = async () => {
     try {
-      const data = await apiFetch("/camera/status", { auth: true });
+      const data = await edgeFetch("/camera/status", { auth: true });
       const { running, alert_status } = data;
 
       setActive(!!running);
@@ -75,7 +75,7 @@ export default function CameraSection() {
         setHistory((prev) => [newEvent, ...prev].slice(0, 10));
       }
 
-      if (running) setStreamUrl(`${API_BASE}/camera/stream?ts=${Date.now()}`);
+      if (running) setStreamUrl(`${EDGE_BASE}/camera/stream?ts=${Date.now()}`);
       else setStreamUrl("");
     } catch (err) {
       // kalau auth gagal
@@ -114,7 +114,7 @@ export default function CameraSection() {
         params.append("index", "0");
       }
 
-      await apiFetch(`/camera/start?${params.toString()}`, {
+      await edgeFetch(`/camera/start?${params.toString()}`, {
         method: "POST",
         auth: true,
       });
@@ -129,7 +129,7 @@ export default function CameraSection() {
   const startDefaultFromDb = async () => {
     try {
       setStatusText("");
-      await apiFetch("/camera/start-default", { method: "POST", auth: true });
+      await edgeFetch("/camera/start-default", { method: "POST", auth: true });
       await refreshStatus();
     } catch (err) {
       setStatusText(`Gagal start default: ${err.message}`);
@@ -139,7 +139,7 @@ export default function CameraSection() {
   // ===== stop (biasanya auth) =====
   const stopCam = async () => {
     try {
-      await apiFetch("/camera/stop", { method: "POST", auth: true });
+      await edgeFetch("/camera/stop", { method: "POST", auth: true });
 
       setActive(false);
       setStreamUrl("");
@@ -312,7 +312,7 @@ export default function CameraSection() {
               </h2>
 
               {active ? (
-                <RoiSelector streamUrl={streamUrl} apiBase={API_BASE} />
+                <RoiSelector streamUrl={streamUrl} apiBase={EDGE_BASE} />
               ) : (
                 <div className="text-center py-20 bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg border-2 border-dashed border-gray-300">
                   <p className="text-gray-500 font-medium">

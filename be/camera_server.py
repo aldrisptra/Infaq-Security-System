@@ -46,7 +46,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # dotenv optional
 try:
     from dotenv import load_dotenv
-    load_dotenv(BASE_DIR / ".env", override=True)
+    load_dotenv(BASE_DIR / ".env", override=False)
 except Exception:
     pass
 

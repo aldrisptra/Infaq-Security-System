@@ -1,9 +1,12 @@
-// src/lib/api.js
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE || "").replace(
+// src/lib/Api.js
+
+// Base URL backend (ambil dari Netlify env: VITE_API_BASE)
+export const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(
   /\/$/,
   ""
 );
 
+// Token helpers
 export function getToken() {
   return localStorage.getItem("authToken");
 }
@@ -16,9 +19,11 @@ export function clearToken() {
   localStorage.removeItem("authToken");
 }
 
+// Response parser
 async function parseBody(res) {
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) return await res.json();
+
   const text = await res.text();
   try {
     return JSON.parse(text);
@@ -27,8 +32,20 @@ async function parseBody(res) {
   }
 }
 
+/**
+ * apiFetch("/auth/login", { method: "POST", body: ..., headers: ... })
+ * apiFetch("/camera/status", { auth: true })
+ *
+ * options.auth = true -> otomatis pasang Authorization: Bearer <token>
+ */
 export async function apiFetch(path, options = {}) {
   const { auth = false, headers = {}, ...rest } = options;
+
+  if (!API_BASE) {
+    const err = new Error("VITE_API_BASE belum diset");
+    err.status = 500;
+    throw err;
+  }
 
   const finalHeaders = { ...headers };
 
@@ -42,7 +59,10 @@ export async function apiFetch(path, options = {}) {
     finalHeaders.Authorization = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
+  // rapihin path biar aman (boleh kirim "auth/login" atau "/auth/login")
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+
+  const res = await fetch(`${API_BASE}${cleanPath}`, {
     ...rest,
     headers: finalHeaders,
   });

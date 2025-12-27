@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 from pydantic import BaseModel, confloat
-import httpx
+import requests
 
 
 # ============================================================
@@ -244,7 +244,7 @@ def tg_send_text(chat_id: str, text: str):
         return {"ok": False, "reason": "token/chat_id kosong"}
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    r = httpx.post(url, data={"chat_id": chat_id, "text": text}, timeout=20.0)
+    r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=20)
     if r.status_code != 200:
         print("[TG] sendMessage ERROR", r.status_code, r.text)
         return {"ok": False, "status": r.status_code, "text": r.text}
@@ -252,17 +252,19 @@ def tg_send_text(chat_id: str, text: str):
 
 def tg_send_photo(chat_id: str, jpg_bytes: bytes, caption: str):
     if not TG_TOKEN or not chat_id:
+        print("[TG] skip: token/chat_id kosong")
         return {"ok": False, "reason": "token/chat_id kosong"}
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
     files = {"photo": ("capture.jpg", jpg_bytes, "image/jpeg")}
     data = {"chat_id": chat_id, "caption": caption}
-    r = httpx.post(url, data=data, files=files, timeout=20.0)
+    r = requests.post(url, data=data, files=files, timeout=20)
 
     if r.status_code != 200:
         print("[TG] sendPhoto ERROR", r.status_code, r.text)
         return {"ok": False, "status": r.status_code, "text": r.text}
 
+    print("[TG] OK sendPhoto to", chat_id)
     return {"ok": True}
 
 

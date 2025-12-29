@@ -16,7 +16,7 @@ from pydantic import BaseModel, confloat
 import requests
 
 # ============================================================
-# MODE SWITCH (Railway aman, Edge tetap full)
+# Helpers
 # ============================================================
 def env_flag(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -25,6 +25,20 @@ def env_flag(name: str, default: bool) -> bool:
     v = v.strip().lower()
     return v in ("1", "true", "yes", "on")
 
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# dotenv optional (JANGAN override env Railway)
+DOTENV_ERROR = None
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv(BASE_DIR / ".env", override=False)
+except Exception as e:
+    DOTENV_ERROR = repr(e)
+
+# ============================================================
+# MODE SWITCH
+# ============================================================
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
 
 # Default: Railway OFF, Lokal ON
@@ -32,7 +46,7 @@ ENABLE_CAPTURE = env_flag("ENABLE_CAPTURE", default=(not IS_RAILWAY))
 ENABLE_YOLO = env_flag("ENABLE_YOLO", default=(not IS_RAILWAY))
 
 # ============================================================
-# Optional heavy imports (cv2/numpy/ultralytics)
+# Optional heavy imports
 # ============================================================
 CV2_IMPORT_ERROR = None
 NP_IMPORT_ERROR = None
@@ -57,19 +71,8 @@ except Exception as e:
     YOLO_IMPORT_ERROR = repr(e)
 
 # ============================================================
-# Optional imports (dotenv/auth/db/models)
-# ============================================================
-BASE_DIR = Path(__file__).resolve().parent
-
-# dotenv optional (JANGAN override env Railway)
-DOTENV_ERROR = None
-try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv(BASE_DIR / ".env", override=False)
-except Exception as e:
-    DOTENV_ERROR = repr(e)
-
 # DB + Models optional
+# ============================================================
 Session = Any
 Camera = Any
 Masjid = Any
@@ -87,62 +90,32 @@ except Exception as e:
     DB_IMPORT_ERROR = repr(e)
 
 def _get_db_none():
-    # Fallback dependency agar FastAPI tidak bikin "db" jadi query param
     return None
 
 DB_DEP = get_db if get_db else _get_db_none
 
 # ============================================================
-# Auth: pakai auth.py kalau bisa, kalau gagal -> fallback auth
+# Auth Router (Railway) optional
 # ============================================================
 AUTH_IMPORT_ERROR = None
 auth_router = None
-CurrentUser = Any
-
-def _dummy_user():
-    class U:
-        id_masjid = 1
-        role = "demo"
-        username = "demo"
-    return U()
-
-def get_current_user():
-    return _dummy_user()
 
 try:
     from auth import router as _auth_router  # type: ignore
-    from auth import get_current_user as _get_current_user, CurrentUser as _CurrentUser  # type: ignore
     auth_router = _auth_router
-    get_current_user = _get_current_user
-    CurrentUser = _CurrentUser
 except Exception as e:
     AUTH_IMPORT_ERROR = repr(e)
     auth_router = None
 
 # ============================================================
-# Fallback auth (biar /auth/login & /auth/register-masjid selalu ada)
+# JWT verify (dipakai untuk EDGE verify token dari Railway)
+# - kita support JWT_SECRET atau SECRET_KEY
 # ============================================================
-FALLBACK_AUTH_ENABLED = env_flag("FALLBACK_AUTH", default=True)
-
-JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+JWT_SECRET = (os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "").strip()
 if not JWT_SECRET:
-    # untuk demo saja (WAJIB diganti di production)
     JWT_SECRET = "dev-secret-change-me"
 
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "86400"))
-
-# store user in memory (DEMO ONLY)
-_fallback_users: Dict[str, Dict[str, Any]] = {}
-_fallback_next_masjid_id = 1
-
-class FallbackUser(BaseModel):
-    username: str
-    role: str = "admin_masjid"
-    id_masjid: int = 1
-    masjid_name: Optional[str] = None
-
-def _hash_pw(pw: str) -> str:
-    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
 
 def _b64url_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
@@ -151,31 +124,22 @@ def _b64url_decode(s: str) -> bytes:
     pad = "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
 
-def _jwt_like_encode(payload: Dict[str, Any]) -> str:
-    """
-    Token mirip JWT (header.payload.signature) tanpa dependency PyJWT.
-    HMAC-SHA256.
-    """
-    header = {"alg": "HS256", "typ": "JWT"}
-    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
-    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
-    sig = hmac.new(JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    sig_b64 = _b64url_encode(sig)
-    return f"{header_b64}.{payload_b64}.{sig_b64}"
-
 def _jwt_like_decode(token: str) -> Dict[str, Any]:
+    """
+    Verify token signature HMAC-SHA256 + exp
+    Token: header.payload.signature (b64url)
+    """
     try:
         header_b64, payload_b64, sig_b64 = token.split(".", 2)
     except ValueError:
-        raise HTTPException(401, "Invalid token format")
+        raise HTTPException(status_code=401, detail="Token tidak valid")
 
     signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
     expected_sig = hmac.new(JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
     expected_sig_b64 = _b64url_encode(expected_sig)
 
     if not hmac.compare_digest(expected_sig_b64, sig_b64):
-        raise HTTPException(401, "Invalid token signature")
+        raise HTTPException(status_code=401, detail="Token tidak valid")
 
     payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
 
@@ -184,16 +148,55 @@ def _jwt_like_decode(token: str) -> Dict[str, Any]:
         try:
             exp_i = int(exp)
             if int(time.time()) > exp_i:
-                raise HTTPException(401, "Token expired")
+                raise HTTPException(status_code=401, detail="Token expired")
+        except HTTPException:
+            raise
         except Exception:
-            raise HTTPException(401, "Invalid token exp")
+            raise HTTPException(status_code=401, detail="Token tidak valid")
 
     return payload
 
+# ============================================================
+# EDGE user (tidak tergantung auth.py)
+# ============================================================
+class EdgeUser(BaseModel):
+    id_masjid: int
+    role: str = "admin_masjid"
+    username: str = ""
+
+def edge_get_current_user(request: Request) -> EdgeUser:
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token tidak valid")
+
+    token = auth.split(" ", 1)[1].strip()
+
+    payload = _jwt_like_decode(token)
+
+    mid = payload.get("masjid_id") or payload.get("id_masjid")
+    if mid is None:
+        # token Railway kamu biasanya punya id_masjid
+        raise HTTPException(status_code=401, detail="Token tidak valid")
+
+    return EdgeUser(
+        id_masjid=int(mid),
+        role=str(payload.get("role") or "admin_masjid"),
+        username=str(payload.get("username") or payload.get("sub") or ""),
+    )
+
+# ============================================================
+# Optional fallback auth (untuk dev lokal kalau auth.py tidak ada)
+# ============================================================
+FALLBACK_AUTH_ENABLED = env_flag("FALLBACK_AUTH", default=True)
+USING_FALLBACK_AUTH = False
+
+_fallback_users: Dict[str, Dict[str, Any]] = {}
+_fallback_next_masjid_id = 1
+
+def _hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
 async def _read_body_any(request: Request) -> Dict[str, Any]:
-    """
-    Terima JSON atau x-www-form-urlencoded agar FE fleksibel.
-    """
     ct = (request.headers.get("content-type") or "").lower()
     if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
         form = await request.form()
@@ -203,122 +206,14 @@ async def _read_body_any(request: Request) -> Dict[str, Any]:
     except Exception:
         return {}
 
-def _fallback_get_current_user(request: Request) -> FallbackUser:
-    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
-    if not auth.startswith("Bearer "):
-        raise HTTPException(401, "Missing Bearer token")
-    token = auth.split(" ", 1)[1].strip()
-    data = _jwt_like_decode(token)
-
-    return FallbackUser(
-        username=str(data.get("username") or "demo"),
-        role=str(data.get("role") or "admin_masjid"),
-        id_masjid=int(data.get("id_masjid") or 1),
-        masjid_name=data.get("masjid_name"),
-    )
-
-# bikin router fallback kalau auth.py gagal
-USING_FALLBACK_AUTH = False
-if auth_router is None and FALLBACK_AUTH_ENABLED:
-    from fastapi import APIRouter
-
-    fallback_router = APIRouter(prefix="/auth", tags=["auth"])
-    USING_FALLBACK_AUTH = True
-
-    @fallback_router.post("/register-masjid")
-    async def register_masjid(request: Request):
-        """
-        Minimal fields (boleh JSON atau form):
-        - username
-        - password
-        - (optional) masjid_name / nama_masjid
-        """
-        global _fallback_next_masjid_id
-        body = await _read_body_any(request)
-
-        username = str(body.get("username") or "").strip()
-        password = str(body.get("password") or "").strip()
-
-        if not username or not password:
-            raise HTTPException(400, "username dan password wajib diisi")
-
-        if username in _fallback_users:
-            raise HTTPException(409, "username sudah terdaftar")
-
-        masjid_name = str(body.get("nama_masjid") or body.get("masjid_name") or "Masjid Demo").strip()
-
-        user = {
-            "username": username,
-            "pw_hash": _hash_pw(password),
-            "role": "admin_masjid",
-            "id_masjid": _fallback_next_masjid_id,
-            "masjid_name": masjid_name,
-        }
-        _fallback_users[username] = user
-        _fallback_next_masjid_id += 1
-
-        payload = {
-            "username": user["username"],
-            "role": user["role"],
-            "id_masjid": user["id_masjid"],
-            "masjid_name": user["masjid_name"],
-            "exp": int(time.time()) + JWT_EXPIRE_SECONDS,
-        }
-        token = _jwt_like_encode(payload)
-
-        # return shape aman untuk banyak FE:
-        return {
-            "ok": True,
-            "token": token,
-            "access_token": token,
-            "token_type": "bearer",
-            "user": {
-                "username": user["username"],
-                "role": user["role"],
-                "id_masjid": user["id_masjid"],
-                "masjid_name": user["masjid_name"],
-            },
-        }
-
-    @fallback_router.post("/login")
-    async def login(request: Request):
-        """
-        Terima JSON / form: username + password
-        """
-        body = await _read_body_any(request)
-
-        username = str(body.get("username") or "").strip()
-        password = str(body.get("password") or "").strip()
-        if not username or not password:
-            raise HTTPException(400, "username dan password wajib diisi")
-
-        u = _fallback_users.get(username)
-        if not u or u["pw_hash"] != _hash_pw(password):
-            raise HTTPException(401, "username/password salah")
-
-        payload = {
-            "username": u["username"],
-            "role": u["role"],
-            "id_masjid": u["id_masjid"],
-            "masjid_name": u.get("masjid_name"),
-            "exp": int(time.time()) + JWT_EXPIRE_SECONDS,
-        }
-        token = _jwt_like_encode(payload)
-
-        # OAuth-ish style:
-        return {
-            "access_token": token,
-            "token_type": "bearer",
-            "user": {"username": u["username"], "role": u["role"], "id_masjid": u["id_masjid"], "masjid_name": u.get("masjid_name")},
-        }
-
-    @fallback_router.get("/me")
-    async def me(user: FallbackUser = Depends(_fallback_get_current_user)):
-        return {"ok": True, "user": user.model_dump()}
-
-    auth_router = fallback_router
-    get_current_user = _fallback_get_current_user
-    CurrentUser = FallbackUser
+def _jwt_like_encode(payload: Dict[str, Any]) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+    sig = hmac.new(JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    sig_b64 = _b64url_encode(sig)
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
 
 # ============================================================
 # ENV / CONFIG
@@ -326,7 +221,6 @@ if auth_router is None and FALLBACK_AUTH_ENABLED:
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
 EDGE_API_KEY = os.getenv("EDGE_API_KEY", "").strip()
 STREAM_TOKEN = os.getenv("STREAM_TOKEN", "").strip()
-
 
 MISSING_WINDOW = int(os.getenv("MISSING_WINDOW", "24"))
 WARN_THRESHOLD = float(os.getenv("WARN_THRESHOLD", "0.40"))
@@ -344,18 +238,16 @@ CENTER_IN_ROI = os.getenv("CENTER_IN_ROI", "1") == "1"
 REQUIRE_ROI = os.getenv("REQUIRE_ROI", "0") == "1"
 DEBUG_LOG = os.getenv("DEBUG_LOG", "1") == "1"
 
-# CORS
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").strip()
 allow_origins = ["*"] if CORS_ORIGINS == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 
-# YOLO weights (edge biasanya lokal)
+# YOLO weights
 DEFAULT_WEIGHT = BASE_DIR / "best.pt"
 ALT_WEIGHT = BASE_DIR / "runs" / "detect" / "train_box" / "weights" / "best.pt"
 if (not DEFAULT_WEIGHT.is_file()) and ALT_WEIGHT.is_file():
     DEFAULT_WEIGHT = ALT_WEIGHT
 YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", str(DEFAULT_WEIGHT))
 
-# Target class filter (opsional)
 TARGET_CLASS_IDS = {int(s) for s in os.getenv("TARGET_CLASS_IDS", "").split(",") if s.strip().isdigit()}
 TARGET_LABELS = {s.strip().lower() for s in os.getenv("TARGET_LABELS", "").split(",") if s.strip()}
 
@@ -377,12 +269,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# include auth router if exists (Railway)
 if auth_router is not None:
     app.include_router(auth_router)
 
+# if no auth router and fallback enabled, provide minimal /auth
+if auth_router is None and FALLBACK_AUTH_ENABLED:
+    from fastapi import APIRouter
+    fallback_router = APIRouter(prefix="/auth", tags=["auth"])
+    USING_FALLBACK_AUTH = True
+
+    @fallback_router.post("/register-masjid")
+    async def register_masjid(request: Request):
+        global _fallback_next_masjid_id
+        body = await _read_body_any(request)
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "").strip()
+        if not username or not password:
+            raise HTTPException(400, "username dan password wajib diisi")
+        if username in _fallback_users:
+            raise HTTPException(409, "username sudah terdaftar")
+
+        masjid_name = str(body.get("nama_masjid") or body.get("masjid_name") or "Masjid Demo").strip()
+
+        u = {
+            "username": username,
+            "pw_hash": _hash_pw(password),
+            "role": "admin_masjid",
+            "id_masjid": _fallback_next_masjid_id,
+            "masjid_name": masjid_name,
+        }
+        _fallback_users[username] = u
+        _fallback_next_masjid_id += 1
+
+        payload = {
+            "username": u["username"],
+            "role": u["role"],
+            "id_masjid": u["id_masjid"],
+            "masjid_name": u["masjid_name"],
+            "exp": int(time.time()) + JWT_EXPIRE_SECONDS,
+        }
+        token = _jwt_like_encode(payload)
+        return {"ok": True, "access_token": token, "token_type": "bearer", "user": payload}
+
+    @fallback_router.post("/login")
+    async def login(request: Request):
+        body = await _read_body_any(request)
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "").strip()
+        if not username or not password:
+            raise HTTPException(400, "username dan password wajib diisi")
+
+        u = _fallback_users.get(username)
+        if not u or u["pw_hash"] != _hash_pw(password):
+            raise HTTPException(401, "username/password salah")
+
+        payload = {
+            "username": u["username"],
+            "role": u["role"],
+            "id_masjid": u["id_masjid"],
+            "masjid_name": u.get("masjid_name"),
+            "exp": int(time.time()) + JWT_EXPIRE_SECONDS,
+        }
+        token = _jwt_like_encode(payload)
+        return {"access_token": token, "token_type": "bearer", "user": payload}
+
+    app.include_router(fallback_router)
+
+# ============================================================
+# Debug
+# ============================================================
 @app.get("/debug/bootstrap")
 def debug_bootstrap():
-    # daftar route biar gampang cek /auth ada atau nggak
     routes = []
     for r in app.routes:
         p = getattr(r, "path", None)
@@ -391,8 +349,6 @@ def debug_bootstrap():
 
     return {
         "is_railway": IS_RAILWAY,
-        "ENABLE_CAPTURE_env": os.getenv("ENABLE_CAPTURE"),
-        "ENABLE_YOLO_env": os.getenv("ENABLE_YOLO"),
         "computed_enable_capture": ENABLE_CAPTURE,
         "computed_enable_yolo": ENABLE_YOLO,
         "dotenv_error": DOTENV_ERROR,
@@ -401,14 +357,23 @@ def debug_bootstrap():
         "cv2_import_error": CV2_IMPORT_ERROR,
         "numpy_import_error": NP_IMPORT_ERROR,
         "ultralytics_import_error": YOLO_IMPORT_ERROR,
-        "fallback_auth_enabled": FALLBACK_AUTH_ENABLED,
         "using_fallback_auth": USING_FALLBACK_AUTH,
         "db_available": bool(get_db),
         "auth_router_loaded": bool(auth_router),
-        "has_auth_routes": any(p.startswith("/auth") for p in routes),
         "sample_routes": routes[:60],
     }
 
+@app.get("/debug/jwt")
+def debug_jwt():
+    s = (os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "").encode("utf-8")
+    return {
+        "has_secret": bool(s),
+        "secret_sha256_8": hashlib.sha256(s).hexdigest()[:8] if s else None,
+    }
+
+# ============================================================
+# Edge Key Guard
+# ============================================================
 def require_edge_key(request: Request):
     """
     Kalau EDGE_API_KEY di-set, semua request ke endpoint edge harus bawa header:
@@ -419,44 +384,6 @@ def require_edge_key(request: Request):
     k = request.headers.get("x-edge-key") or request.headers.get("X-Edge-Key") or ""
     if k != EDGE_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid edge key")
-
-
-@app.get("/debug/env")
-def debug_env():
-    return {
-        "ENABLE_CAPTURE": os.getenv("ENABLE_CAPTURE"),
-        "ENABLE_YOLO": os.getenv("ENABLE_YOLO"),
-        "computed_enable_capture": ENABLE_CAPTURE,
-        "computed_enable_yolo": ENABLE_YOLO,
-    }
-
-@app.get("/debug/railway")
-def debug_railway():
-    return {
-        "RAILWAY_ENVIRONMENT": os.getenv("RAILWAY_ENVIRONMENT"),
-        "RAILWAY_PROJECT_ID": os.getenv("RAILWAY_PROJECT_ID"),
-        "RAILWAY_SERVICE_ID": os.getenv("RAILWAY_SERVICE_ID"),
-        "PORT": os.getenv("PORT"),
-        "ENABLE_CAPTURE": os.getenv("ENABLE_CAPTURE"),
-        "ENABLE_YOLO": os.getenv("ENABLE_YOLO"),
-    }
-
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "msg": "camera_server up",
-        "enable_capture": ENABLE_CAPTURE,
-        "enable_yolo": ENABLE_YOLO,
-        "cv2": bool(cv2),
-        "numpy": bool(np),
-        "ultralytics": bool(YOLO),
-        "token_loaded": bool(TG_TOKEN),
-        "db_available": bool(get_db),
-        "auth_available": bool(auth_router),
-        "is_railway": IS_RAILWAY,
-        "using_fallback_auth": USING_FALLBACK_AUTH,
-    }
 
 # ============================================================
 # ROI (file-based)
@@ -476,20 +403,17 @@ def load_roi_rel() -> Optional[ROISchema]:
         text = ROI_PATH.read_text(encoding="utf-8").strip()
         if not text:
             return None
-        data = json.loads(text)
-        return ROISchema(**data)
+        return ROISchema(**json.loads(text))
     except Exception as e:
         print("[ROI] load error:", repr(e))
         return None
 
 def save_roi_rel(roi: ROISchema) -> None:
     try:
-        if hasattr(roi, "model_dump_json"):
-            ROI_PATH.write_text(roi.model_dump_json(), encoding="utf-8")
-        else:
-            ROI_PATH.write_text(roi.json(), encoding="utf-8")
-    except Exception as e:
-        print("[ROI] save error:", repr(e))
+        ROI_PATH.write_text(roi.model_dump_json(), encoding="utf-8")
+    except Exception:
+        # pydantic v1 fallback
+        ROI_PATH.write_text(roi.json(), encoding="utf-8")
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -586,24 +510,6 @@ def get_latest_camera_for_masjid(db: Session, masjid_id: int):
         .first()
     )
 
-def get_tg_target_by_camera_id(db: Session, camera_id: int):
-    if db is None:
-        return None
-    row = (
-        db.query(Masjid.id_masjid, Masjid.tg_chat_id, Masjid.tg_cooldown)
-        .join(Camera, Camera.id_masjid == Masjid.id_masjid)
-        .filter(Camera.id_camera == camera_id)
-        .first()
-    )
-    if not row:
-        return None
-    id_masjid, chat_id, cooldown = row
-    chat_id = (str(chat_id).strip() if chat_id is not None else "")
-    if not chat_id:
-        return None
-    cooldown = int(cooldown) if cooldown is not None else 10
-    return {"id_masjid": int(id_masjid), "chat_id": chat_id, "cooldown": cooldown}
-
 def get_tg_target_by_masjid_id(db: Session, masjid_id: int):
     if db is None:
         return None
@@ -618,15 +524,10 @@ def get_tg_target_by_masjid_id(db: Session, masjid_id: int):
 
 last_alert_ts_by_masjid: Dict[int, float] = {}
 
-def maybe_send_alert_photo(db: Session, camera_id: Optional[int], masjid_id: Optional[int], frame):
-    if cv2 is None:
+def maybe_send_alert_photo(db: Session, masjid_id: Optional[int], frame):
+    if cv2 is None or masjid_id is None:
         return
-
-    target = None
-    if camera_id:
-        target = get_tg_target_by_camera_id(db, camera_id)
-    if (not target) and masjid_id:
-        target = get_tg_target_by_masjid_id(db, masjid_id)
+    target = get_tg_target_by_masjid_id(db, masjid_id)
     if not target:
         return
 
@@ -646,23 +547,6 @@ def maybe_send_alert_photo(db: Session, camera_id: Optional[int], masjid_id: Opt
     res = tg_send_photo(chat_id, jpg_buf.tobytes(), "⚠️ ALERT: Kotak infaq tidak terdeteksi!")
     if res.get("ok"):
         last_alert_ts_by_masjid[mid] = now
-
-@app.get("/debug/tg/me")
-def debug_tg_me(current_user: CurrentUser = Depends(get_current_user), db: Session = Depends(DB_DEP)):
-    if db is None:
-        return {"ok": False, "msg": "DB belum tersedia (mode cloud / fallback)"}
-    target = get_tg_target_by_masjid_id(db, current_user.id_masjid)
-    return {"ok": True, "masjid_id": current_user.id_masjid, "target": target, "token_loaded": bool(TG_TOKEN)}
-
-@app.post("/debug/tg/test")
-def debug_tg_test(current_user: CurrentUser = Depends(get_current_user), db: Session = Depends(DB_DEP)):
-    if db is None:
-        return {"ok": False, "msg": "DB belum tersedia (mode cloud / fallback)"}
-    target = get_tg_target_by_masjid_id(db, current_user.id_masjid)
-    if not target:
-        return {"ok": False, "msg": "tg_chat_id kosong / masjid tidak ditemukan"}
-    res = tg_send_text(target["chat_id"], f"✅ TEST NOTIF untuk masjid_id={target['id_masjid']}")
-    return {"ok": True, "target": target, "send_result": res}
 
 # ============================================================
 # YOLO (lazy init)
@@ -771,7 +655,7 @@ def infer_and_draw(frame, counter: int, roi_rect):
     return dets
 
 # ============================================================
-# Global State (stream)
+# Global state (stream)
 # ============================================================
 cap: Optional[Any] = None
 running: bool = False
@@ -779,14 +663,11 @@ latest_jpeg: Optional[bytes] = None
 lock = threading.Lock()
 
 alert_status: str = "present"
-
 stream_ready = False
 last_frame_ts = 0.0
 last_cap_error = None
 
-
-
-CUR_SOURCE: str = "webcam"   # webcam | video | ipcam
+CUR_SOURCE: str = "webcam"
 CUR_INDEX: int = 0
 CUR_PATH: Optional[str] = None
 CUR_LOOP: bool = False
@@ -832,7 +713,6 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
 
     global cap, running, latest_jpeg, alert_status, stream_ready, last_frame_ts, last_cap_error
 
-    # reset stream state tiap start
     stream_ready = False
     last_frame_ts = 0.0
     last_cap_error = None
@@ -843,7 +723,6 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
         return
 
     if cv2 is None or np is None:
-        print("[CAP] cv2/numpy belum ada -> mode cloud/dashboard saja")
         running = False
         last_cap_error = "cv2/numpy tidak tersedia"
         return
@@ -853,39 +732,32 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
         try:
             ensure_model()
         except Exception as e:
-            print("[YOLO] ensure_model error:", repr(e))
             if ENABLE_YOLO:
                 running = False
                 last_cap_error = f"YOLO init gagal: {repr(e)}"
                 return
 
-        # === 1) buka capture pertama kali
         cap = reopen_capture(source, index, path, sleep_s=1.0)
         if cap is None:
             running = False
-            last_cap_error = "Gagal membuka kamera/capture (cap is None / not opened)"
+            last_cap_error = "Gagal membuka kamera/capture"
             return
 
-        # coba baca frame awal
         ok0, frame0 = cap.read()
         if not ok0:
-            # release & coba buka lagi
             try:
                 cap.release()
             except Exception:
                 pass
-
-            # === 2) buka capture ulang kalau frame pertama gagal
             cap = reopen_capture(source, index, path, sleep_s=1.0)
             if cap is None:
                 running = False
-                last_cap_error = "Gagal membuka kamera/capture setelah retry pertama"
+                last_cap_error = "Gagal membuka kamera/capture setelah retry"
                 return
-
             ok0, frame0 = cap.read()
             if not ok0:
                 running = False
-                last_cap_error = "Tidak bisa membaca frame pertama dari kamera (ok0 false)"
+                last_cap_error = "Tidak bisa membaca frame pertama"
                 return
 
         roi = roi_rect_px(frame0.shape)
@@ -893,7 +765,6 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
         missing_streak = 0
         counter = 0
         roi_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
-
         fail_read_streak = 0
 
         while running:
@@ -901,25 +772,21 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             if not ok:
                 fail_read_streak += 1
 
-                # untuk video looping
                 if source == "video" and loop_video and fail_read_streak >= 2:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     fail_read_streak = 0
                     time.sleep(0.02)
                     continue
 
-                # kalau gagal terlalu sering, coba reconnect
                 if fail_read_streak >= 15:
                     try:
                         cap.release()
                     except Exception:
                         pass
-
                     cap = reopen_capture(source, index, path, sleep_s=1.0)
                     fail_read_streak = 0
-
                     if cap is None:
-                        last_cap_error = "Reconnect gagal: cap is None"
+                        last_cap_error = "Reconnect gagal"
                         time.sleep(0.2)
                         continue
 
@@ -929,7 +796,6 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             fail_read_streak = 0
             counter += 1
 
-            # reload ROI kalau berubah
             if counter % 30 == 0:
                 new_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
                 if new_mtime != roi_mtime:
@@ -963,7 +829,7 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             alert_status = "missing" if status_str == "ALERT" else "present"
 
             if TG_TOKEN and status_str == "ALERT" and old_alert != "missing":
-                maybe_send_alert_photo(db, camera_id, masjid_id, frame)
+                maybe_send_alert_photo(db, masjid_id, frame)
 
             if roi:
                 cv2.rectangle(frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 165, 0), 2)
@@ -1002,13 +868,26 @@ def mjpeg_gen():
             )
         time.sleep(0.02)
 
-def gen_frames():
-    yield from mjpeg_gen()
-        
+# ============================================================
+# Routes
+# ============================================================
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "msg": "camera_server up",
+        "is_railway": IS_RAILWAY,
+        "enable_capture": ENABLE_CAPTURE,
+        "enable_yolo": ENABLE_YOLO,
+        "cv2": bool(cv2),
+        "numpy": bool(np),
+        "ultralytics": bool(YOLO),
+        "token_loaded": bool(TG_TOKEN),
+        "db_available": bool(get_db),
+        "auth_router_loaded": bool(auth_router),
+        "using_fallback_auth": USING_FALLBACK_AUTH,
+    }
 
-# ============================================================
-# Camera API
-# ============================================================
 @app.get("/camera/status")
 def camera_status(request: Request):
     require_edge_key(request)
@@ -1031,21 +910,22 @@ def camera_status(request: Request):
 @app.get("/camera/default")
 def camera_default(request: Request):
     require_edge_key(request)
-    # kembalikan state terakhir yang tersimpan di server (atau default)
     return {
         "source": CUR_SOURCE or "webcam",
         "index": CUR_INDEX or 0,
         "path": CUR_PATH,
         "loop": CUR_LOOP if CUR_LOOP is not None else True,
         "camera_id": CUR_CAMERA_ID,
-        "camera_name": None,
     }
 
 @app.post("/camera/start-default")
 def start_default(
-    current_user: CurrentUser = Depends(get_current_user),
+    request: Request,
+    current_user: EdgeUser = Depends(edge_get_current_user),
     db: Session = Depends(DB_DEP),
 ):
+    require_edge_key(request)
+
     if not ENABLE_CAPTURE:
         raise HTTPException(503, "Capture disabled (cloud mode)")
     if db is None:
@@ -1059,19 +939,19 @@ def start_default(
         raise HTTPException(400, "Camera source_path kosong")
 
     return start_camera(
+        request=request,
+        current_user=current_user,
         source=cam.source_type,
         index=cam.source_index or 0,
         path=cam.source_path,
         loop=True,
         camera_id=cam.id_camera,
-        current_user=current_user,
-        db=db,
     )
 
 @app.post("/camera/start")
 def start_camera(
     request: Request,
-    current_user: CurrentUser = Depends(get_current_user),  # ✅ tambah ini
+    current_user: EdgeUser = Depends(edge_get_current_user),
     source: str = Query("webcam", pattern="^(webcam|video|ipcam)$"),
     index: int = 0,
     path: Optional[str] = None,
@@ -1093,7 +973,7 @@ def start_camera(
 
     CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP = source, index, path, loop
     CUR_CAMERA_ID = camera_id
-    CUR_MASJID_ID = getattr(current_user, "id_masjid", None)  # ✅ INI PENTING
+    CUR_MASJID_ID = current_user.id_masjid
 
     stream_ready = False
     last_cap_error = None
@@ -1107,7 +987,7 @@ def start_camera(
             "path": path,
             "loop_video": loop,
             "camera_id": CUR_CAMERA_ID,
-            "masjid_id": CUR_MASJID_ID,  # ✅ sekarang kebawa ke thread
+            "masjid_id": CUR_MASJID_ID,
         },
         daemon=True,
     ).start()
@@ -1127,11 +1007,9 @@ def stop_camera(request: Request):
     responses={200: {"description": "MJPEG stream", "content": {"multipart/x-mixed-replace; boundary=frame": {}}}},
 )
 def camera_stream(token: Optional[str] = Query(None)):
-    # kalau STREAM_TOKEN diset, wajib benar
     if STREAM_TOKEN and token != STREAM_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid stream token")
 
-    # kalau kamera belum jalan atau belum ada frame, jangan loading kosong
     if not running:
         raise HTTPException(status_code=409, detail="Camera is not running yet")
     if not stream_ready:
@@ -1142,3 +1020,30 @@ def camera_stream(token: Optional[str] = Query(None)):
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )
+
+@app.get("/debug/tg/me")
+def debug_tg_me(
+    request: Request,
+    current_user: EdgeUser = Depends(edge_get_current_user),
+    db: Session = Depends(DB_DEP),
+):
+    require_edge_key(request)
+    if db is None:
+        return {"ok": False, "msg": "DB belum tersedia"}
+    target = get_tg_target_by_masjid_id(db, current_user.id_masjid)
+    return {"ok": True, "masjid_id": current_user.id_masjid, "target": target, "token_loaded": bool(TG_TOKEN)}
+
+@app.post("/debug/tg/test")
+def debug_tg_test(
+    request: Request,
+    current_user: EdgeUser = Depends(edge_get_current_user),
+    db: Session = Depends(DB_DEP),
+):
+    require_edge_key(request)
+    if db is None:
+        return {"ok": False, "msg": "DB belum tersedia"}
+    target = get_tg_target_by_masjid_id(db, current_user.id_masjid)
+    if not target:
+        return {"ok": False, "msg": "tg_chat_id kosong / masjid tidak ditemukan"}
+    res = tg_send_text(target["chat_id"], f"✅ TEST NOTIF untuk masjid_id={target['id_masjid']}")
+    return {"ok": True, "target": target, "send_result": res}

@@ -324,6 +324,9 @@ if auth_router is None and FALLBACK_AUTH_ENABLED:
 # ENV / CONFIG
 # ============================================================
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
+EDGE_API_KEY = os.getenv("EDGE_API_KEY", "").strip()
+STREAM_TOKEN = os.getenv("STREAM_TOKEN", "").strip()
+
 
 MISSING_WINDOW = int(os.getenv("MISSING_WINDOW", "24"))
 WARN_THRESHOLD = float(os.getenv("WARN_THRESHOLD", "0.40"))
@@ -405,6 +408,18 @@ def debug_bootstrap():
         "has_auth_routes": any(p.startswith("/auth") for p in routes),
         "sample_routes": routes[:60],
     }
+
+def require_edge_key(request: Request):
+    """
+    Kalau EDGE_API_KEY di-set, semua request ke endpoint edge harus bawa header:
+    X-Edge-Key: <EDGE_API_KEY>
+    """
+    if not EDGE_API_KEY:
+        return
+    k = request.headers.get("x-edge-key") or request.headers.get("X-Edge-Key") or ""
+    if k != EDGE_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid edge key")
+
 
 @app.get("/debug/env")
 def debug_env():
@@ -762,6 +777,12 @@ lock = threading.Lock()
 
 alert_status: str = "present"
 
+stream_ready = False
+last_frame_ts = 0.0
+last_cap_error = None
+
+
+
 CUR_SOURCE: str = "webcam"   # webcam | video | ipcam
 CUR_INDEX: int = 0
 CUR_PATH: Optional[str] = None
@@ -806,15 +827,22 @@ def reopen_capture(source: str, index: int, path: Optional[str], sleep_s: float 
 def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
                  camera_id: Optional[int], masjid_id: Optional[int]):
 
-    global cap, running, latest_jpeg, alert_status
+    global cap, running, latest_jpeg, alert_status, stream_ready, last_frame_ts, last_cap_error
+
+    # reset stream state tiap start
+    stream_ready = False
+    last_frame_ts = 0.0
+    last_cap_error = None
 
     if not ENABLE_CAPTURE:
         running = False
+        last_cap_error = "Capture disabled (ENABLE_CAPTURE=false)"
         return
 
     if cv2 is None or np is None:
         print("[CAP] cv2/numpy belum ada -> mode cloud/dashboard saja")
         running = False
+        last_cap_error = "cv2/numpy tidak tersedia"
         return
 
     db, gen = _open_thread_db_session()
@@ -825,26 +853,36 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             print("[YOLO] ensure_model error:", repr(e))
             if ENABLE_YOLO:
                 running = False
+                last_cap_error = f"YOLO init gagal: {repr(e)}"
                 return
 
+        # === 1) buka capture pertama kali
         cap = reopen_capture(source, index, path, sleep_s=1.0)
         if cap is None:
             running = False
+            last_cap_error = "Gagal membuka kamera/capture (cap is None / not opened)"
             return
 
+        # coba baca frame awal
         ok0, frame0 = cap.read()
         if not ok0:
+            # release & coba buka lagi
             try:
                 cap.release()
             except Exception:
                 pass
+
+            # === 2) buka capture ulang kalau frame pertama gagal
             cap = reopen_capture(source, index, path, sleep_s=1.0)
             if cap is None:
                 running = False
+                last_cap_error = "Gagal membuka kamera/capture setelah retry pertama"
                 return
+
             ok0, frame0 = cap.read()
             if not ok0:
                 running = False
+                last_cap_error = "Tidak bisa membaca frame pertama dari kamera (ok0 false)"
                 return
 
         roi = roi_rect_px(frame0.shape)
@@ -860,19 +898,27 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             if not ok:
                 fail_read_streak += 1
 
+                # untuk video looping
                 if source == "video" and loop_video and fail_read_streak >= 2:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     fail_read_streak = 0
                     time.sleep(0.02)
                     continue
 
+                # kalau gagal terlalu sering, coba reconnect
                 if fail_read_streak >= 15:
                     try:
                         cap.release()
                     except Exception:
                         pass
+
                     cap = reopen_capture(source, index, path, sleep_s=1.0)
                     fail_read_streak = 0
+
+                    if cap is None:
+                        last_cap_error = "Reconnect gagal: cap is None"
+                        time.sleep(0.2)
+                        continue
 
                 time.sleep(0.02)
                 continue
@@ -880,6 +926,7 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             fail_read_streak = 0
             counter += 1
 
+            # reload ROI kalau berubah
             if counter % 30 == 0:
                 new_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
                 if new_mtime != roi_mtime:
@@ -922,6 +969,9 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             if ok2:
                 with lock:
                     latest_jpeg = jpg.tobytes()
+                    stream_ready = True
+                    last_frame_ts = time.time()
+                    last_cap_error = None
 
             time.sleep(0.01)
 
@@ -931,6 +981,7 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
                 cap.release()
         except Exception:
             pass
+        stream_ready = False
         _close_thread_db_session(gen)
 
 # ============================================================
@@ -948,13 +999,21 @@ def mjpeg_gen():
             )
         time.sleep(0.02)
 
+def gen_frames():
+    yield from mjpeg_gen()
+        
+
 # ============================================================
 # Camera API
 # ============================================================
 @app.get("/camera/status")
-def camera_status():
+def camera_status(request: Request):
+    require_edge_key(request)
     return {
         "running": running,
+        "stream_ready": stream_ready,
+        "last_frame_ts": last_frame_ts,
+        "last_cap_error": last_cap_error,
         "alert_status": alert_status,
         "camera_id": CUR_CAMERA_ID,
         "masjid_id": CUR_MASJID_ID,
@@ -967,24 +1026,16 @@ def camera_status():
     }
 
 @app.get("/camera/default")
-def camera_default(
-    current_user: CurrentUser = Depends(get_current_user),
-    db: Session = Depends(DB_DEP),
-):
-    if db is None:
-        return {"source": "ipcam", "index": 0, "path": None, "loop": True, "camera_id": None, "camera_name": None}
-
-    cam = get_latest_camera_for_masjid(db, current_user.id_masjid)
-    if not cam:
-        return {"source": "webcam", "index": 0, "path": None, "loop": True, "camera_id": None, "camera_name": None}
-
+def camera_default(request: Request):
+    require_edge_key(request)
+    # kembalikan state terakhir yang tersimpan di server (atau default)
     return {
-        "source": cam.source_type,
-        "index": cam.source_index or 0,
-        "path": cam.source_path,
-        "loop": True,
-        "camera_id": cam.id_camera,
-        "camera_name": cam.nama,
+        "source": CUR_SOURCE or "webcam",
+        "index": CUR_INDEX or 0,
+        "path": CUR_PATH,
+        "loop": CUR_LOOP if CUR_LOOP is not None else True,
+        "camera_id": CUR_CAMERA_ID,
+        "camera_name": None,
     }
 
 @app.post("/camera/start-default")
@@ -1016,15 +1067,16 @@ def start_default(
 
 @app.post("/camera/start")
 def start_camera(
+    request: Request,
     source: str = Query("webcam", pattern="^(webcam|video|ipcam)$"),
     index: int = 0,
     path: Optional[str] = None,
     loop: bool = True,
     camera_id: Optional[int] = None,
-    current_user: CurrentUser = Depends(get_current_user),
-    db: Session = Depends(DB_DEP),
 ):
-    global running, CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP, CUR_CAMERA_ID, CUR_MASJID_ID
+    require_edge_key(request)
+
+    global running, CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP, CUR_CAMERA_ID, CUR_MASJID_ID, stream_ready, last_cap_error
 
     if not ENABLE_CAPTURE:
         raise HTTPException(503, "Capture disabled (cloud mode)")
@@ -1038,14 +1090,12 @@ def start_camera(
     if source in ("video", "ipcam") and not path:
         raise HTTPException(400, "path wajib diisi untuk video/ipcam")
 
-    if camera_id is None and db is not None:
-        cam = get_latest_camera_for_masjid(db, getattr(current_user, "id_masjid", 1))
-        if cam:
-            camera_id = cam.id_camera
-
     CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP = source, index, path, loop
     CUR_CAMERA_ID = camera_id
-    CUR_MASJID_ID = getattr(current_user, "id_masjid", None)
+    CUR_MASJID_ID = None
+
+    stream_ready = False
+    last_cap_error = None
 
     running = True
     threading.Thread(
@@ -1072,7 +1122,8 @@ def start_camera(
     }
 
 @app.post("/camera/stop")
-def stop_camera(current_user: CurrentUser = Depends(get_current_user)):
+def stop_camera(request: Request):
+    require_edge_key(request)
     global running
     running = False
     return {"ok": True}
@@ -1082,7 +1133,19 @@ def stop_camera(current_user: CurrentUser = Depends(get_current_user)):
     response_class=StreamingResponse,
     responses={200: {"description": "MJPEG stream", "content": {"multipart/x-mixed-replace; boundary=frame": {}}}},
 )
-def stream():
+def camera_stream(token: Optional[str] = Query(None)):
+    # kalau STREAM_TOKEN diset, wajib benar
+    if STREAM_TOKEN and token != STREAM_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid stream token")
+
+    # kalau kamera belum jalan atau belum ada frame, jangan loading kosong
     if not running:
-        raise HTTPException(400, "camera not running")
-    return StreamingResponse(mjpeg_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+        raise HTTPException(status_code=409, detail="Camera is not running yet")
+    if not stream_ready:
+        raise HTTPException(status_code=425, detail="Stream not ready yet (waiting first frame)")
+
+    return StreamingResponse(
+        mjpeg_gen(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )

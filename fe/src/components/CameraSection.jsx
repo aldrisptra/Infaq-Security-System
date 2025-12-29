@@ -4,6 +4,8 @@ import RoiSelector from "./RoiSelector.jsx";
 import Header from "./Header.jsx";
 import { edgeFetch, EDGE_BASE, clearToken, getToken } from "../lib/Api.js";
 
+const STREAM_TOKEN = import.meta.env.VITE_STREAM_TOKEN || "";
+
 export default function CameraSection() {
   const navigate = useNavigate();
 
@@ -42,7 +44,6 @@ export default function CameraSection() {
           setMode("webcam");
         }
       } catch (err) {
-        // kalau token invalid/expired
         if (err.status === 401) {
           clearToken();
           navigate("/login", { replace: true });
@@ -51,7 +52,7 @@ export default function CameraSection() {
     })();
   }, [navigate]);
 
-  // ===== polling status (boleh public, tapi kita kirim auth juga aman) =====
+  // ===== polling status =====
   const refreshStatus = async () => {
     try {
       const data = await edgeFetch("/camera/status", { auth: true });
@@ -75,10 +76,15 @@ export default function CameraSection() {
         setHistory((prev) => [newEvent, ...prev].slice(0, 10));
       }
 
-      if (running) setStreamUrl(`${EDGE_BASE}/camera/stream?ts=${Date.now()}`);
-      else setStreamUrl("");
+      if (running) {
+        const tokenPart = STREAM_TOKEN
+          ? `token=${encodeURIComponent(STREAM_TOKEN)}&`
+          : "";
+        setStreamUrl(`${EDGE_BASE}/camera/stream?${tokenPart}ts=${Date.now()}`);
+      } else {
+        setStreamUrl("");
+      }
     } catch (err) {
-      // kalau auth gagal
       if (err.status === 401) {
         clearToken();
         navigate("/login", { replace: true });
@@ -93,7 +99,7 @@ export default function CameraSection() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ===== start manual (WAJIB auth) =====
+  // ===== start manual =====
   const startCam = async () => {
     try {
       setStatusText("");
@@ -136,7 +142,7 @@ export default function CameraSection() {
     }
   };
 
-  // ===== stop (biasanya auth) =====
+  // ===== stop =====
   const stopCam = async () => {
     try {
       await edgeFetch("/camera/stop", { method: "POST", auth: true });
@@ -166,9 +172,7 @@ export default function CameraSection() {
       <Header onLogout={handleLogout} />
 
       <div className="max-w-7xl mx-auto">
-        {/* Status Cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 py-6 px-4 sm:px-7">
-          {/* Camera Status */}
           <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-blue-500">
             <div className="flex items-center justify-between">
               <div>
@@ -186,7 +190,6 @@ export default function CameraSection() {
             </div>
           </div>
 
-          {/* Box Status */}
           <div
             className={`bg-white rounded-xl shadow-lg p-6 border-l-4 ${
               alertStatus === "missing"
@@ -216,7 +219,6 @@ export default function CameraSection() {
             </div>
           </div>
 
-          {/* Total Kejadian */}
           <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-emerald-700">
             <div className="flex items-center justify-between">
               <div>
@@ -231,11 +233,8 @@ export default function CameraSection() {
           </div>
         </div>
 
-        {/* Main Content */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 sm:px-7 px-4 pb-6">
-          {/* Left */}
           <div className="lg:col-span-2 space-y-6">
-            {/* Controls */}
             <div className="bg-white rounded-xl shadow-lg p-6">
               <h2 className="text-xl font-bold text-gray-800 mb-4">
                 🎛️ Kontrol Kamera
@@ -305,7 +304,6 @@ export default function CameraSection() {
               )}
             </div>
 
-            {/* Video Feed */}
             <div className="bg-white rounded-xl shadow-lg p-6">
               <h2 className="text-xl font-bold text-gray-800 mb-4">
                 📡 Live Camera
@@ -326,7 +324,6 @@ export default function CameraSection() {
             </div>
           </div>
 
-          {/* Right - History */}
           <div className="lg:col-span-1">
             <div className="bg-white rounded-xl shadow-lg p-6 sticky top-6">
               <div className="flex items-center justify-between mb-4">

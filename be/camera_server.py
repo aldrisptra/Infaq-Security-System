@@ -365,11 +365,20 @@ def debug_bootstrap():
 
 @app.get("/debug/jwt")
 def debug_jwt():
-    s = (os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "").encode("utf-8")
+    env_val = (os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "").strip()
+    used_val = JWT_SECRET  # yang dipakai beneran
+
+    def sha8(s: str):
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:8] if s else None
+
     return {
-        "has_secret": bool(s),
-        "secret_sha256_8": hashlib.sha256(s).hexdigest()[:8] if s else None,
+        "env_present": bool(env_val),
+        "env_sha256_8": sha8(env_val),
+        "used_sha256_8": sha8(used_val),
+        "using_dev_fallback": used_val == "dev-secret-change-me",
+        "is_railway": IS_RAILWAY,
     }
+
 
 # ============================================================
 # Edge Key Guard

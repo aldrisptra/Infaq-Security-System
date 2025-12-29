@@ -511,11 +511,13 @@ class ROIResponse(BaseModel):
     roi: Optional[ROISchema] = None
 
 @app.get("/roi", response_model=ROIResponse)
-def get_roi(current_user: CurrentUser = Depends(get_current_user)):
+def get_roi(request: Request):
+    require_edge_key(request)
     return ROIResponse(roi=load_roi_rel())
 
 @app.post("/roi", response_model=ROIResponse)
-def set_roi(roi: ROISchema, current_user: CurrentUser = Depends(get_current_user)):
+def set_roi(request: Request, roi: ROISchema):
+    require_edge_key(request)
     if roi.w <= 0 or roi.h <= 0:
         raise HTTPException(400, "w/h harus > 0")
     if roi.x + roi.w > 1 or roi.y + roi.h > 1:
@@ -524,7 +526,8 @@ def set_roi(roi: ROISchema, current_user: CurrentUser = Depends(get_current_user
     return ROIResponse(roi=roi)
 
 @app.delete("/roi")
-def clear_roi(current_user: CurrentUser = Depends(get_current_user)):
+def clear_roi(request: Request):
+    require_edge_key(request)
     try:
         ROI_PATH.unlink(missing_ok=True)
     except Exception as e:

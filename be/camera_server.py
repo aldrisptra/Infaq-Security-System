@@ -1071,6 +1071,7 @@ def start_default(
 @app.post("/camera/start")
 def start_camera(
     request: Request,
+    current_user: CurrentUser = Depends(get_current_user),  # ✅ tambah ini
     source: str = Query("webcam", pattern="^(webcam|video|ipcam)$"),
     index: int = 0,
     path: Optional[str] = None,
@@ -1083,19 +1084,16 @@ def start_camera(
 
     if not ENABLE_CAPTURE:
         raise HTTPException(503, "Capture disabled (cloud mode)")
-
     if cv2 is None:
         raise HTTPException(503, "OpenCV tidak tersedia")
-
     if running:
         return {"ok": True, "msg": "already running"}
-
     if source in ("video", "ipcam") and not path:
         raise HTTPException(400, "path wajib diisi untuk video/ipcam")
 
     CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP = source, index, path, loop
     CUR_CAMERA_ID = camera_id
-    CUR_MASJID_ID = None
+    CUR_MASJID_ID = getattr(current_user, "id_masjid", None)  # ✅ INI PENTING
 
     stream_ready = False
     last_cap_error = None
@@ -1109,20 +1107,12 @@ def start_camera(
             "path": path,
             "loop_video": loop,
             "camera_id": CUR_CAMERA_ID,
-            "masjid_id": CUR_MASJID_ID,
+            "masjid_id": CUR_MASJID_ID,  # ✅ sekarang kebawa ke thread
         },
         daemon=True,
     ).start()
 
-    return {
-        "ok": True,
-        "source": source,
-        "index": index,
-        "path": path,
-        "loop": loop,
-        "camera_id": CUR_CAMERA_ID,
-        "masjid_id": CUR_MASJID_ID,
-    }
+    return {"ok": True, "camera_id": CUR_CAMERA_ID, "masjid_id": CUR_MASJID_ID}
 
 @app.post("/camera/stop")
 def stop_camera(request: Request):

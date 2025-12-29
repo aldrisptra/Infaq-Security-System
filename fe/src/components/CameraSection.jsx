@@ -45,7 +45,8 @@ export default function CameraSection() {
         }
       } catch (err) {
         if (err.status === 401) {
-          clearToken();
+          console.log("401 camera:", err.message, err.data);
+          // clearToken(); // <-- matiin dulu biar token gak hilang
           navigate("/login", { replace: true });
         }
       }
@@ -93,6 +94,9 @@ export default function CameraSection() {
   };
 
   useEffect(() => {
+    // ✅ tambah ini di paling atas
+    if (!getToken()) return;
+
     refreshStatus();
     const t = setInterval(refreshStatus, 1500);
     return () => clearInterval(t);

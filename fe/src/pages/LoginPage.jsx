@@ -19,28 +19,24 @@ export default function LoginPage() {
       const body = new URLSearchParams();
       body.append("username", username);
       body.append("password", password);
-      body.append("scope", "");
 
       const res = await fetch(`${API_BASE_URL}/auth/login`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body,
       });
 
+      const data = await res.json().catch(() => ({}));
+
       if (!res.ok) {
-        let detail = "Login gagal. Periksa kembali username / password.";
-        try {
-          const data = await res.json();
-          if (data?.detail) detail = data.detail;
-        } catch (_) {}
+        const detail =
+          data?.detail || "Login gagal. Periksa kembali username / password.";
         throw new Error(detail);
       }
 
-      const data = await res.json();
-
+      // ✅ simpan token saat sukses
       localStorage.setItem("authToken", data.access_token);
+      localStorage.setItem("token_type", data.token_type || "bearer");
 
       navigate("/camera");
     } catch (err) {

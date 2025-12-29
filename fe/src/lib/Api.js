@@ -10,7 +10,7 @@ export const EDGE_BASE =
   "http://127.0.0.1:8000";
 
 // kunci untuk Edge (header X-Edge-Key)
-const EDGE_KEY = import.meta.env.VITE_EDGE_KEY || "";
+const EDGE_KEY = (import.meta.env.VITE_EDGE_KEY || "").trim();
 
 // ===== token storage =====
 export function getToken() {

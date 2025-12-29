@@ -3,24 +3,29 @@ import { useEffect, useRef, useState } from "react";
 
 function getRequestHeaders(isJson = false) {
   const headers = {};
+
+  // 1) Edge key (untuk edge laptop)
   const edgeKey = import.meta.env.VITE_EDGE_KEY || "";
   if (edgeKey) headers["X-Edge-Key"] = edgeKey;
 
+  // 2) Bearer token (kalau edge masih butuh auth juga)
   const token = localStorage.getItem("authToken");
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  headers["Accept"] = "application/json";
   if (isJson) headers["Content-Type"] = "application/json";
+  headers["Accept"] = "application/json";
+
   return headers;
 }
 
 export default function RoiSelector({ streamUrl, apiBase }) {
   const containerRef = useRef(null);
-  const [roi, setRoi] = useState(null);
+  const [roi, setRoi] = useState(null); // {x, y, w, h} dalam 0–1
   const [dragging, setDragging] = useState(false);
   const [startPos, setStartPos] = useState(null);
   const [statusText, setStatusText] = useState("");
 
+  // Ambil ROI awal dari backend
   useEffect(() => {
     async function fetchROI() {
       try {
@@ -34,55 +39,40 @@ export default function RoiSelector({ streamUrl, apiBase }) {
         console.error("Gagal ambil ROI:", err);
       }
     }
+
     fetchROI();
   }, [apiBase]);
 
   const clamp01 = (v) => Math.min(1, Math.max(0, v));
 
-  const getXY = (e) => {
-    const el = containerRef.current;
-    if (!el) return null;
-    const rect = el.getBoundingClientRect();
+  const handleMouseDown = (e) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
     const x = clamp01((e.clientX - rect.left) / rect.width);
     const y = clamp01((e.clientY - rect.top) / rect.height);
-    return { x, y };
-  };
 
-  const handlePointerDown = (e) => {
-    if (!containerRef.current) return;
-    // penting biar di HP nggak scroll/zoom saat drag
-    e.preventDefault();
-
-    // “kunci” pointer biar move tetap masuk walau jari keluar sedikit dari area
-    try {
-      containerRef.current.setPointerCapture(e.pointerId);
-    } catch (_) {}
-
-    const p = getXY(e);
-    if (!p) return;
-
-    setStartPos(p);
-    setRoi({ x: p.x, y: p.y, w: 0, h: 0 });
+    setStartPos({ x, y });
+    setRoi({ x, y, w: 0, h: 0 });
     setDragging(true);
   };
 
-  const handlePointerMove = (e) => {
-    if (!dragging || !startPos || !containerRef.current) return;
-    e.preventDefault();
+  const handleMouseMove = (e) => {
+    if (!dragging || !containerRef.current || !startPos) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = clamp01((e.clientX - rect.left) / rect.width);
+    const y = clamp01((e.clientY - rect.top) / rect.height);
 
-    const p = getXY(e);
-    if (!p) return;
-
-    const left = Math.min(startPos.x, p.x);
-    const top = Math.min(startPos.y, p.y);
-    const w = Math.abs(p.x - startPos.x);
-    const h = Math.abs(p.y - startPos.y);
+    const x1 = startPos.x;
+    const y1 = startPos.y;
+    const left = Math.min(x1, x);
+    const top = Math.min(y1, y);
+    const w = Math.abs(x - x1);
+    const h = Math.abs(y - y1);
 
     setRoi({ x: left, y: top, w, h });
   };
 
-  const endDrag = (e) => {
-    if (e) e.preventDefault();
+  const endDrag = () => {
     setDragging(false);
     setStartPos(null);
   };
@@ -124,6 +114,7 @@ export default function RoiSelector({ streamUrl, apiBase }) {
         const text = await res.text();
         throw new Error(text || "Gagal menghapus ROI");
       }
+
       setRoi(null);
       setStatusText("ROI dihapus.");
     } catch (err) {
@@ -136,19 +127,17 @@ export default function RoiSelector({ streamUrl, apiBase }) {
     <div className="space-y-3">
       <div
         ref={containerRef}
-        className="relative w-full bg-black rounded-lg overflow-hidden cursor-crosshair aspect-video select-none"
-        style={{ touchAction: "none" }} // ini kuncinya untuk HP
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
-        onPointerLeave={endDrag}
+        className="relative w-full bg-black rounded-lg overflow-hidden cursor-crosshair aspect-video"
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={endDrag}
+        onMouseLeave={endDrag}
       >
         {streamUrl ? (
           <img
             src={streamUrl}
             alt="Camera stream"
-            className="w-full h-full object-contain pointer-events-none"
+            className="w-full h-full object-contain select-none pointer-events-none"
             draggable={false}
           />
         ) : (
@@ -159,7 +148,7 @@ export default function RoiSelector({ streamUrl, apiBase }) {
 
         {roi && roi.w > 0 && roi.h > 0 && (
           <div
-            className="absolute border-2 border-amber-400 bg-amber-300/10 pointer-events-none"
+            className="absolute border-2 border-amber-400 bg-amber-300/10"
             style={{
               left: `${roi.x * 100}%`,
               top: `${roi.y * 100}%`,
@@ -171,8 +160,8 @@ export default function RoiSelector({ streamUrl, apiBase }) {
       </div>
 
       <p className="text-xs text-gray-600">
-        🖱️ Klik/drag pada video untuk menentukan area ROI, lalu klik{" "}
-        <span className="font-semibold">Simpan ROI</span>.
+        🖱️ Klik & drag pada video untuk menentukan area kotak infaq (ROI).
+        Kemudian klik <span className="font-semibold">Simpan ROI</span>.
       </p>
 
       <div className="flex gap-3">

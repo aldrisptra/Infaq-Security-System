@@ -1,380 +1,198 @@
+// src/components/RoiSelector.jsx
 import { useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import RoiSelector from "./RoiSelector.jsx";
-import Header from "./Header.jsx";
-import { edgeFetch, EDGE_BASE, clearToken, getToken } from "../lib/Api.js";
 
-const STREAM_TOKEN = import.meta.env.VITE_STREAM_TOKEN || "";
+function getRequestHeaders(isJson = false) {
+  const headers = {};
+  const edgeKey = import.meta.env.VITE_EDGE_KEY || "";
+  if (edgeKey) headers["X-Edge-Key"] = edgeKey;
 
-export default function CameraSection() {
-  const navigate = useNavigate();
+  const token = localStorage.getItem("authToken");
+  if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const [mode, setMode] = useState("webcam"); // webcam | video | ipcam
-  const [videoPath, setVideoPath] = useState("sample/mesjid_kotak.mp4");
-  const [ipcamUrl, setIpcamUrl] = useState("");
+  headers["Accept"] = "application/json";
+  if (isJson) headers["Content-Type"] = "application/json";
+  return headers;
+}
 
-  const [active, setActive] = useState(false);
-  const [streamUrl, setStreamUrl] = useState("");
+export default function RoiSelector({ streamUrl, apiBase }) {
+  const containerRef = useRef(null);
+  const [roi, setRoi] = useState(null);
+  const [dragging, setDragging] = useState(false);
+  const [startPos, setStartPos] = useState(null);
   const [statusText, setStatusText] = useState("");
-  const [alertStatus, setAlertStatus] = useState(null);
-  const [history, setHistory] = useState([]);
 
-  const lastAlertRef = useRef(null);
-
-  // ===== load default camera dari DB (butuh auth) =====
   useEffect(() => {
-    const token = getToken();
-    if (!token) {
-      navigate("/login", { replace: true });
-      return;
-    }
-
-    (async () => {
+    async function fetchROI() {
       try {
-        const cfg = await edgeFetch("/camera/default", { auth: true });
-        if (!cfg) return;
-
-        if (cfg.source === "ipcam") {
-          setMode("ipcam");
-          setIpcamUrl(cfg.path || "");
-        } else if (cfg.source === "video") {
-          setMode("video");
-          setVideoPath(cfg.path || "sample/mesjid_kotak.mp4");
-        } else {
-          setMode("webcam");
-        }
+        const res = await fetch(`${apiBase}/roi`, {
+          headers: getRequestHeaders(false),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data?.roi) setRoi(data.roi);
       } catch (err) {
-        if (err.status === 401) {
-          clearToken();
-          navigate("/login", { replace: true });
-        }
-      }
-    })();
-  }, [navigate]);
-
-  // ===== polling status =====
-  const refreshStatus = async () => {
-    try {
-      const data = await edgeFetch("/camera/status", { auth: true });
-      const { running, alert_status } = data;
-
-      setActive(!!running);
-      setAlertStatus(alert_status);
-
-      const last = lastAlertRef.current;
-      if (alert_status && alert_status !== last) {
-        lastAlertRef.current = alert_status;
-        const newEvent = {
-          id: Date.now(),
-          status: alert_status,
-          timestamp: new Date().toLocaleString("id-ID"),
-          message:
-            alert_status === "missing"
-              ? "⚠️ Kotak infaq tidak terdeteksi!"
-              : "✓ Kotak infaq terdeteksi",
-        };
-        setHistory((prev) => [newEvent, ...prev].slice(0, 10));
-      }
-
-      if (running) {
-        const tokenPart = STREAM_TOKEN
-          ? `token=${encodeURIComponent(STREAM_TOKEN)}&`
-          : "";
-        setStreamUrl(`${EDGE_BASE}/camera/stream?${tokenPart}ts=${Date.now()}`);
-      } else {
-        setStreamUrl("");
-      }
-    } catch (err) {
-      if (err.status === 401) {
-        clearToken();
-        navigate("/login", { replace: true });
+        console.error("Gagal ambil ROI:", err);
       }
     }
+    fetchROI();
+  }, [apiBase]);
+
+  const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+  const getXY = (e) => {
+    const el = containerRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const x = clamp01((e.clientX - rect.left) / rect.width);
+    const y = clamp01((e.clientY - rect.top) / rect.height);
+    return { x, y };
   };
 
-  useEffect(() => {
-    refreshStatus();
-    const t = setInterval(refreshStatus, 1500);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const handlePointerDown = (e) => {
+    if (!containerRef.current) return;
+    // penting biar di HP nggak scroll/zoom saat drag
+    e.preventDefault();
 
-  // ===== start manual =====
-  const startCam = async () => {
+    // “kunci” pointer biar move tetap masuk walau jari keluar sedikit dari area
     try {
-      setStatusText("");
+      containerRef.current.setPointerCapture(e.pointerId);
+    } catch (_) {}
 
-      const params = new URLSearchParams();
+    const p = getXY(e);
+    if (!p) return;
 
-      if (mode === "video") {
-        params.append("source", "video");
-        params.append("path", videoPath);
-        params.append("loop", "true");
-      } else if (mode === "ipcam") {
-        if (!ipcamUrl) throw new Error("IP Camera URL masih kosong");
-        params.append("source", "ipcam");
-        params.append("path", ipcamUrl);
-        params.append("loop", "true");
-      } else {
-        params.append("source", "webcam");
-        params.append("index", "0");
+    setStartPos(p);
+    setRoi({ x: p.x, y: p.y, w: 0, h: 0 });
+    setDragging(true);
+  };
+
+  const handlePointerMove = (e) => {
+    if (!dragging || !startPos || !containerRef.current) return;
+    e.preventDefault();
+
+    const p = getXY(e);
+    if (!p) return;
+
+    const left = Math.min(startPos.x, p.x);
+    const top = Math.min(startPos.y, p.y);
+    const w = Math.abs(p.x - startPos.x);
+    const h = Math.abs(p.y - startPos.y);
+
+    setRoi({ x: left, y: top, w, h });
+  };
+
+  const endDrag = (e) => {
+    if (e) e.preventDefault();
+    setDragging(false);
+    setStartPos(null);
+  };
+
+  async function handleSave() {
+    try {
+      if (!roi || roi.w === 0 || roi.h === 0) {
+        setStatusText("Gambar dulu area ROI di atas video.");
+        return;
       }
+      setStatusText("Menyimpan ROI...");
 
-      await edgeFetch(`/camera/start?${params.toString()}`, {
+      const res = await fetch(`${apiBase}/roi`, {
         method: "POST",
-        auth: true,
+        headers: getRequestHeaders(true),
+        body: JSON.stringify(roi),
       });
 
-      await refreshStatus();
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || "Gagal menyimpan ROI");
+      }
+
+      setStatusText("ROI berhasil disimpan ✅");
     } catch (err) {
-      setStatusText(`Gagal start: ${err.message}`);
+      console.error(err);
+      setStatusText(err.message || "Gagal menyimpan ROI");
     }
-  };
+  }
 
-  // ===== start dari default DB =====
-  const startDefaultFromDb = async () => {
+  async function handleClear() {
     try {
-      setStatusText("");
-      await edgeFetch("/camera/start-default", { method: "POST", auth: true });
-      await refreshStatus();
+      setStatusText("Menghapus ROI...");
+      const res = await fetch(`${apiBase}/roi`, {
+        method: "DELETE",
+        headers: getRequestHeaders(false),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || "Gagal menghapus ROI");
+      }
+      setRoi(null);
+      setStatusText("ROI dihapus.");
     } catch (err) {
-      setStatusText(`Gagal start default: ${err.message}`);
+      console.error(err);
+      setStatusText(err.message || "Gagal menghapus ROI");
     }
-  };
-
-  // ===== stop =====
-  const stopCam = async () => {
-    try {
-      await edgeFetch("/camera/stop", { method: "POST", auth: true });
-
-      setActive(false);
-      setStreamUrl("");
-      setStatusText("");
-      setAlertStatus(null);
-      lastAlertRef.current = null;
-    } catch (err) {
-      setStatusText(`Gagal stop: ${err.message}`);
-    }
-  };
-
-  const handleLogout = async () => {
-    try {
-      if (active) await stopCam();
-    } catch (_) {}
-    clearToken();
-    navigate("/login", { replace: true });
-  };
-
-  const clearHistory = () => setHistory([]);
+  }
 
   return (
-    <div className="min-h-screen bg-emerald-900">
-      <Header onLogout={handleLogout} />
-
-      <div className="max-w-7xl mx-auto">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 py-6 px-4 sm:px-7">
-          <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-blue-500">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-gray-500 font-medium">
-                  Status Kamera
-                </p>
-                <p
-                  className={`text-2xl font-bold mt-1 ${
-                    active ? "text-emerald-700" : "text-gray-400"
-                  }`}
-                >
-                  {active ? "Aktif" : "Nonaktif"}
-                </p>
-              </div>
-            </div>
+    <div className="space-y-3">
+      <div
+        ref={containerRef}
+        className="relative w-full bg-black rounded-lg overflow-hidden cursor-crosshair aspect-video select-none"
+        style={{ touchAction: "none" }} // ini kuncinya untuk HP
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onPointerLeave={endDrag}
+      >
+        {streamUrl ? (
+          <img
+            src={streamUrl}
+            alt="Camera stream"
+            className="w-full h-full object-contain pointer-events-none"
+            draggable={false}
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center text-gray-400 text-sm">
+            Stream belum tersedia
           </div>
+        )}
 
+        {roi && roi.w > 0 && roi.h > 0 && (
           <div
-            className={`bg-white rounded-xl shadow-lg p-6 border-l-4 ${
-              alertStatus === "missing"
-                ? "border-red-500"
-                : "border-emerald-700"
-            }`}
-          >
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-gray-500 font-medium">
-                  Status Kotak
-                </p>
-                <p
-                  className={`text-2xl font-bold mt-1 ${
-                    alertStatus === "missing"
-                      ? "text-red-600"
-                      : "text-emerald-700"
-                  }`}
-                >
-                  {alertStatus === "missing"
-                    ? "Hilang"
-                    : alertStatus === "present"
-                    ? "Aman"
-                    : "-"}
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-emerald-700">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-gray-500 font-medium">
-                  Total Kejadian
-                </p>
-                <p className="text-2xl font-bold text-emerald-700 mt-1">
-                  {history.length}
-                </p>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 sm:px-7 px-4 pb-6">
-          <div className="lg:col-span-2 space-y-6">
-            <div className="bg-white rounded-xl shadow-lg p-6">
-              <h2 className="text-xl font-bold text-gray-800 mb-4">
-                🎛️ Kontrol Kamera
-              </h2>
-
-              <div className="flex flex-wrap gap-3 items-center">
-                <select
-                  value={mode}
-                  onChange={(e) => setMode(e.target.value)}
-                  className="border border-gray-300 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="webcam">🎥 Webcam</option>
-                  <option value="video">📹 Video File</option>
-                  <option value="ipcam">📱 IP Camera</option>
-                </select>
-
-                {mode === "video" && (
-                  <input
-                    type="text"
-                    value={videoPath}
-                    onChange={(e) => setVideoPath(e.target.value)}
-                    className="flex-1 min-w-[280px] border border-gray-300 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                )}
-
-                {mode === "ipcam" && (
-                  <input
-                    type="text"
-                    value={ipcamUrl}
-                    onChange={(e) => setIpcamUrl(e.target.value)}
-                    placeholder="http://192.168.1.8:4747/video"
-                    className="flex-1 min-w-[280px] border border-gray-300 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                )}
-
-                {!active ? (
-                  <>
-                    <button
-                      onClick={startCam}
-                      className="px-6 py-2.5 bg-gradient-to-r from-teal-600 to-teal-700 text-white font-medium rounded-lg hover:from-teal-700 hover:to-teal-800 active:scale-95 transition-all shadow-md"
-                    >
-                      Start Kamera
-                    </button>
-
-                    <button
-                      onClick={startDefaultFromDb}
-                      className="px-5 py-2.5 bg-white border border-emerald-200 text-emerald-800 font-medium rounded-lg hover:bg-emerald-50 active:scale-95 transition-all"
-                      title="Ambil sumber kamera default dari database"
-                    >
-                      Start Default (DB)
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    onClick={stopCam}
-                    className="px-6 py-2.5 bg-gradient-to-r from-red-500 to-red-600 text-white font-medium rounded-lg hover:from-red-600 hover:to-red-700 active:scale-95 transition-all shadow-md"
-                  >
-                    Stop Kamera
-                  </button>
-                )}
-              </div>
-
-              {statusText && (
-                <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg">
-                  <p className="text-sm text-red-600">{statusText}</p>
-                </div>
-              )}
-            </div>
-
-            <div className="bg-white rounded-xl shadow-lg p-6">
-              <h2 className="text-xl font-bold text-gray-800 mb-4">
-                📡 Live Camera
-              </h2>
-
-              {active ? (
-                <RoiSelector streamUrl={streamUrl} apiBase={EDGE_BASE} />
-              ) : (
-                <div className="text-center py-20 bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg border-2 border-dashed border-gray-300">
-                  <p className="text-gray-500 font-medium">
-                    Kamera belum aktif
-                  </p>
-                  <p className="text-sm text-gray-400 mt-1">
-                    Klik "Start Kamera" atau "Start Default (DB)"
-                  </p>
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="lg:col-span-1">
-            <div className="bg-white rounded-xl shadow-lg p-6 sticky top-6">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-xl font-bold text-gray-800">
-                  🕒 Riwayat Kejadian
-                </h2>
-                {history.length > 0 && (
-                  <button
-                    onClick={clearHistory}
-                    className="text-xs text-gray-500 hover:text-red-600"
-                  >
-                    Clear
-                  </button>
-                )}
-              </div>
-
-              <div className="space-y-3 max-h-[600px] overflow-y-auto pr-2">
-                {history.length === 0 ? (
-                  <div className="text-center py-10">
-                    <p className="text-sm text-gray-400">Belum ada kejadian</p>
-                  </div>
-                ) : (
-                  history.map((event) => (
-                    <div
-                      key={event.id}
-                      className={`p-4 rounded-lg border-l-4 ${
-                        event.status === "missing"
-                          ? "bg-red-50 border-red-500"
-                          : "bg-green-50 border-green-500"
-                      }`}
-                    >
-                      <p
-                        className={`text-sm font-medium ${
-                          event.status === "missing"
-                            ? "text-red-800"
-                            : "text-green-800"
-                        }`}
-                      >
-                        {event.message}
-                      </p>
-                      <p className="text-xs text-gray-500 mt-1">
-                        {event.timestamp}
-                      </p>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
+            className="absolute border-2 border-amber-400 bg-amber-300/10 pointer-events-none"
+            style={{
+              left: `${roi.x * 100}%`,
+              top: `${roi.y * 100}%`,
+              width: `${roi.w * 100}%`,
+              height: `${roi.h * 100}%`,
+            }}
+          />
+        )}
       </div>
+
+      <p className="text-xs text-gray-600">
+        🖱️ Klik/drag pada video untuk menentukan area ROI, lalu klik{" "}
+        <span className="font-semibold">Simpan ROI</span>.
+      </p>
+
+      <div className="flex gap-3">
+        <button
+          type="button"
+          onClick={handleSave}
+          className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 transition"
+        >
+          Simpan ROI
+        </button>
+        <button
+          type="button"
+          onClick={handleClear}
+          className="px-4 py-2 rounded-lg border border-gray-300 text-gray-700 text-sm hover:bg-gray-50 transition"
+        >
+          Hapus ROI
+        </button>
+      </div>
+
+      {statusText && <p className="text-xs text-gray-500 mt-1">{statusText}</p>}
     </div>
   );
 }

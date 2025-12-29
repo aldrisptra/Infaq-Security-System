@@ -78,10 +78,13 @@ export default function CameraSection() {
       }
 
       if (running) {
-        const tokenPart = STREAM_TOKEN
-          ? `token=${encodeURIComponent(STREAM_TOKEN)}&`
-          : "";
-        setStreamUrl(`${EDGE_BASE}/camera/stream?${tokenPart}ts=${Date.now()}`);
+        setStreamUrl((prev) => {
+          if (prev) return prev; // ✅ sudah ada, jangan ganti2 lagi
+          const qs = new URLSearchParams();
+          if (STREAM_TOKEN) qs.set("token", STREAM_TOKEN);
+          qs.set("ts", String(Date.now())); // ✅ cukup sekali untuk “anti cache”
+          return `${EDGE_BASE}/camera/stream?${qs.toString()}`;
+        });
       } else {
         setStreamUrl("");
       }

@@ -837,7 +837,8 @@ def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
             old_alert = alert_status
             alert_status = "missing" if status_str == "ALERT" else "present"
 
-            if TG_TOKEN and status_str == "ALERT" and old_alert != "missing":
+            if TG_TOKEN and status_str == "ALERT":
+                print("[ALERT] sending TG. masjid_id=", masjid_id)
                 maybe_send_alert_photo(db, masjid_id, frame)
 
             if roi:
@@ -986,7 +987,8 @@ def start_camera(
 
     stream_ready = False
     last_cap_error = None
-
+    global alert_status
+    alert_status = "present"
     running = True
     threading.Thread(
         target=capture_loop,

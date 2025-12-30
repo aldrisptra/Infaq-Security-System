@@ -78,25 +78,15 @@ export default function CameraSection() {
       }
 
       // ✅ Hanya set streamUrl jika running DAN stream_ready = true
-      if (running) {
+      if (running && stream_ready) {
         setStreamUrl((prev) => {
-          if (prev) return prev;
-
+          if (prev) return prev; // ✅ sudah ada, jangan ganti2 lagi
           const qs = new URLSearchParams();
-
-          // token: pakai STREAM_TOKEN kalau ada, kalau gak ada fallback ke JWT login
-          const jwt = getToken();
-          const t = STREAM_TOKEN || jwt;
-          if (t) qs.set("token", t);
-
-          // kalau backend kamu pakai EDGE KEY, ikutkan juga via query
-          const edgeKey = import.meta.env.VITE_EDGE_KEY || "";
-          if (edgeKey) qs.set("edge_key", edgeKey);
-
-          qs.set("ts", String(Date.now()));
+          if (STREAM_TOKEN) qs.set("token", STREAM_TOKEN);
+          qs.set("ts", String(Date.now())); // ✅ cukup sekali untuk "anti cache"
           return `${EDGE_BASE}/camera/stream?${qs.toString()}`;
         });
-      } else {
+      } else if (!running) {
         setStreamUrl("");
       }
     } catch (err) {
@@ -326,9 +316,6 @@ export default function CameraSection() {
               <h2 className="text-xl font-bold text-gray-800 mb-4">
                 📡 Live Camera
               </h2>
-              <div className="text-xs text-gray-400 break-all mb-2">
-                active: {String(active)} | streamUrl: {streamUrl || "(kosong)"}
-              </div>
 
               {active ? (
                 <RoiSelector streamUrl={streamUrl} apiBase={EDGE_BASE} />

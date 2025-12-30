@@ -18,9 +18,9 @@ export default function Header({ onLogout }) {
             </div>
 
             <div>
-              <h1 className="text-white text-2xl md:text-4xl font-bold leading-tight">
+              <h1 className="text-white text-sm md:text-4xl font-bold leading-tight">
                 <TextType
-                  text={["Infaq Security System", "Infaq Security System"]}
+                  text={["Infaq Security System", "Infaq SecuritySystem"]}
                   typingSpeed={75}
                   pauseDuration={1500}
                   showCursor={true}

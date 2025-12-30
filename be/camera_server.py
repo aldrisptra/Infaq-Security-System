@@ -518,17 +518,27 @@ def capture_worker(source: str, index: int, path: Optional[str], loop_video: boo
     except Exception:
         pass
 
-def mjpeg_generator():
-    boundary = b"frame"
-    # ✅ jangan error kalau belum ada frame: tunggu saja sampai latest_jpeg terisi
+def mjpeg_gen_wait():
+    boundary = "frame"
     while True:
         with lock:
             buf = latest_jpeg
+            is_running = running
+
+        if not is_running:
+            # kalau kamera stop, berhenti streaming
+            time.sleep(0.1)
+            continue
+
         if buf:
-            yield (b"--" + boundary + b"\r\n"
-                   b"Content-Type: image/jpeg\r\n"
-                   b"Cache-Control: no-store\r\n\r\n" + buf + b"\r\n")
-        time.sleep(0.02)
+            yield (
+                b"--" + boundary.encode() + b"\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Cache-Control: no-store\r\n\r\n" + buf + b"\r\n"
+            )
+        else:
+            # belum ada frame pertama → tunggu (TAPI JANGAN return error)
+            time.sleep(0.05)
 
 # ============================================================
 # Auth untuk stream: token bisa STREAM_TOKEN atau JWT
@@ -645,22 +655,23 @@ def camera_stop(request: Request):
     running = False
     return {"ok": True}
 
-@app.get("/camera/stream")
-def camera_stream(request: Request):
-    # ✅ auth: edge_key bisa via query, token bisa via query/header
-    if not stream_auth_ok(request):
-        raise HTTPException(401, "Unauthorized stream")
+@app.get(
+    "/camera/stream",
+    response_class=StreamingResponse,
+    responses={200: {"description": "MJPEG stream"}},
+)
+def camera_stream(token: Optional[str] = Query(None)):
+    if STREAM_TOKEN and token != STREAM_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid stream token")
 
     if not running:
-        raise HTTPException(409, "Camera is not running yet")
+        raise HTTPException(status_code=409, detail="Camera is not running yet")
 
+    # ✅ jangan 425 — biarkan stream nunggu frame pertama
     return StreamingResponse(
-        mjpeg_generator(),
+        mjpeg_gen_wait(),
         media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-        },
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )
 
 @app.get("/camera/frame.jpg")

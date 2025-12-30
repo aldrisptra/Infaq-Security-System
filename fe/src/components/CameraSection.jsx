@@ -10,7 +10,7 @@ export default function CameraSection() {
   const navigate = useNavigate();
 
   const [mode, setMode] = useState("webcam"); // webcam | video | ipcam
-  const [videoPath, setVideoPath] = useState("sample/mesjid_kotak.mp4");
+  const [videoPath, setVideoPath] = useState("assets/sample/mesjid_kotak.mp4");
   const [ipcamUrl, setIpcamUrl] = useState("");
 
   const [active, setActive] = useState(false);
@@ -57,7 +57,7 @@ export default function CameraSection() {
   const refreshStatus = async () => {
     try {
       const data = await edgeFetch("/camera/status", { auth: true });
-      const { running, alert_status } = data;
+      const { running, alert_status, stream_ready } = data;
 
       setActive(!!running);
       setAlertStatus(alert_status);
@@ -77,12 +77,23 @@ export default function CameraSection() {
         setHistory((prev) => [newEvent, ...prev].slice(0, 10));
       }
 
+      // ✅ Hanya set streamUrl jika running DAN stream_ready = true
       if (running) {
         setStreamUrl((prev) => {
-          if (prev) return prev; // ✅ sudah ada, jangan ganti2 lagi
+          if (prev) return prev;
+
           const qs = new URLSearchParams();
-          if (STREAM_TOKEN) qs.set("token", STREAM_TOKEN);
-          qs.set("ts", String(Date.now())); // ✅ cukup sekali untuk “anti cache”
+
+          // token: pakai STREAM_TOKEN kalau ada, kalau gak ada fallback ke JWT login
+          const jwt = getToken();
+          const t = STREAM_TOKEN || jwt;
+          if (t) qs.set("token", t);
+
+          // kalau backend kamu pakai EDGE KEY, ikutkan juga via query
+          const edgeKey = import.meta.env.VITE_EDGE_KEY || "";
+          if (edgeKey) qs.set("edge_key", edgeKey);
+
+          qs.set("ts", String(Date.now()));
           return `${EDGE_BASE}/camera/stream?${qs.toString()}`;
         });
       } else {
@@ -315,6 +326,9 @@ export default function CameraSection() {
               <h2 className="text-xl font-bold text-gray-800 mb-4">
                 📡 Live Camera
               </h2>
+              <div className="text-xs text-gray-400 break-all mb-2">
+                active: {String(active)} | streamUrl: {streamUrl || "(kosong)"}
+              </div>
 
               {active ? (
                 <RoiSelector streamUrl={streamUrl} apiBase={EDGE_BASE} />

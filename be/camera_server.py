@@ -2,113 +2,121 @@
 import os
 import time
 import json
-import hmac
-import base64
-import hashlib
 import threading
+import hashlib
+import base64
+import hmac
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Tuple, Dict, Any, List
 
-from fastapi import FastAPI, HTTPException, Request, Query, Depends
+from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel, confloat
 import requests
 
 # ============================================================
-# Utils
+# Helpers
 # ============================================================
-BASE_DIR = Path(__file__).resolve().parent
-
 def env_flag(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
-    return v.strip().lower() in ("1", "true", "yes", "on")
+    v = v.strip().lower()
+    return v in ("1", "true", "yes", "on")
 
-# optional dotenv (jangan override env prod)
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# dotenv optional (JANGAN override env Railway)
+DOTENV_ERROR = None
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv(BASE_DIR / ".env", override=False)
-except Exception:
-    pass
+except Exception as e:
+    DOTENV_ERROR = repr(e)
 
+# ============================================================
+# MODE SWITCH
+# ============================================================
 IS_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
+
+# Default: Railway OFF, Lokal ON
 ENABLE_CAPTURE = env_flag("ENABLE_CAPTURE", default=(not IS_RAILWAY))
 ENABLE_YOLO = env_flag("ENABLE_YOLO", default=(not IS_RAILWAY))
 
 # ============================================================
 # Optional heavy imports
 # ============================================================
-CV2_ERR = None
-NP_ERR = None
-YOLO_ERR = None
+CV2_IMPORT_ERROR = None
+NP_IMPORT_ERROR = None
+YOLO_IMPORT_ERROR = None
 
 try:
     import cv2  # type: ignore
 except Exception as e:
     cv2 = None
-    CV2_ERR = repr(e)
+    CV2_IMPORT_ERROR = repr(e)
 
 try:
     import numpy as np  # type: ignore
 except Exception as e:
     np = None
-    NP_ERR = repr(e)
+    NP_IMPORT_ERROR = repr(e)
 
 try:
     from ultralytics import YOLO  # type: ignore
 except Exception as e:
     YOLO = None
-    YOLO_ERR = repr(e)
+    YOLO_IMPORT_ERROR = repr(e)
 
 # ============================================================
-# ENV CONFIG
+# DB + Models optional
 # ============================================================
-EDGE_API_KEY = os.getenv("EDGE_API_KEY", "").strip()  # FE: VITE_EDGE_KEY
-STREAM_TOKEN = os.getenv("STREAM_TOKEN", "").strip()  # FE: VITE_STREAM_TOKEN
+Session = Any
+Camera = Any
+Masjid = Any
+get_db = None
+DB_IMPORT_ERROR = None
 
-TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
+try:
+    from sqlalchemy.orm import Session as _Session  # type: ignore
+    Session = _Session
+    from database import get_db as _get_db  # type: ignore
+    get_db = _get_db
+    from models import Camera as _Camera, Masjid as _Masjid  # type: ignore
+    Camera, Masjid = _Camera, _Masjid
+except Exception as e:
+    DB_IMPORT_ERROR = repr(e)
 
-JWT_SECRET = (os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "dev-secret-change-me").strip()
+def _get_db_none():
+    return None
+
+DB_DEP = get_db if get_db else _get_db_none
+
+# ============================================================
+# Auth Router (Railway) optional
+# ============================================================
+AUTH_IMPORT_ERROR = None
+auth_router = None
+
+try:
+    from auth import router as _auth_router  # type: ignore
+    auth_router = _auth_router
+except Exception as e:
+    AUTH_IMPORT_ERROR = repr(e)
+    auth_router = None
+
+# ============================================================
+# JWT verify (dipakai untuk EDGE verify token dari Railway)
+# - kita support JWT_SECRET atau SECRET_KEY
+# ============================================================
+JWT_SECRET = (os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "").strip()
+if not JWT_SECRET:
+    JWT_SECRET = "dev-secret-change-me"
+
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "86400"))
 
-# YOLO params
-YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", str(BASE_DIR / "best.pt"))
-YOLO_CONF = float(os.getenv("YOLO_CONF", "0.50"))
-YOLO_IOU = float(os.getenv("YOLO_IOU", "0.90"))
-YOLO_IMG = int(os.getenv("YOLO_IMG", "800"))
-INFER_EVERY = int(os.getenv("INFER_EVERY", "1"))
-
-# target filter (optional)
-TARGET_CLASS_IDS = {int(s) for s in os.getenv("TARGET_CLASS_IDS", "").split(",") if s.strip().isdigit()}
-TARGET_LABELS = {s.strip().lower() for s in os.getenv("TARGET_LABELS", "").split(",") if s.strip()}
-
-# alert logic (optional)
-MISSING_WINDOW = int(os.getenv("MISSING_WINDOW", "24"))
-WARN_THRESHOLD = float(os.getenv("WARN_THRESHOLD", "0.40"))
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "0.70"))
-PRESENT_GRACE = int(os.getenv("PRESENT_GRACE", "10"))
-COOLDOWN_DEFAULT = int(os.getenv("TG_COOLDOWN", "10"))
-
-# ============================================================
-# CORS
-# ============================================================
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").strip()
-allow_origins = ["*"] if CORS_ORIGINS == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
-
-app = FastAPI(docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ============================================================
-# JWT (simple HS256)
-# ============================================================
 def _b64url_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
 
@@ -116,54 +124,59 @@ def _b64url_decode(s: str) -> bytes:
     pad = "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
 
-def jwt_encode(payload: Dict[str, Any]) -> str:
-    header = {"alg": "HS256", "typ": "JWT"}
-    h = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
-    p = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    signing_input = f"{h}.{p}".encode("utf-8")
-    sig = hmac.new(JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    s = _b64url_encode(sig)
-    return f"{h}.{p}.{s}"
-
-def jwt_verify(token: str) -> Dict[str, Any]:
+def _jwt_like_decode(token: str) -> Dict[str, Any]:
+    """
+    Verify token signature HMAC-SHA256 + exp
+    Token: header.payload.signature (b64url)
+    """
     try:
-        h_b64, p_b64, s_b64 = token.split(".", 2)
+        header_b64, payload_b64, sig_b64 = token.split(".", 2)
     except ValueError:
-        raise HTTPException(401, "Token tidak valid")
+        raise HTTPException(status_code=401, detail="Token tidak valid")
 
-    signing_input = f"{h_b64}.{p_b64}".encode("utf-8")
-    exp_sig = hmac.new(JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    exp_b64 = _b64url_encode(exp_sig)
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+    expected_sig = hmac.new(JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    expected_sig_b64 = _b64url_encode(expected_sig)
 
-    if not hmac.compare_digest(exp_b64, s_b64):
-        raise HTTPException(401, "Token tidak valid")
+    if not hmac.compare_digest(expected_sig_b64, sig_b64):
+        raise HTTPException(status_code=401, detail="Token tidak valid")
 
-    payload = json.loads(_b64url_decode(p_b64).decode("utf-8"))
+    payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+
     exp = payload.get("exp")
-    if exp is not None and int(time.time()) > int(exp):
-        raise HTTPException(401, "Token expired")
+    if exp is not None:
+        try:
+            exp_i = int(exp)
+            if int(time.time()) > exp_i:
+                raise HTTPException(status_code=401, detail="Token expired")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=401, detail="Token tidak valid")
+
     return payload
 
+# ============================================================
+# EDGE user (tidak tergantung auth.py)
+# ============================================================
 class EdgeUser(BaseModel):
     id_masjid: int
     role: str = "admin_masjid"
     username: str = ""
 
-def read_bearer_from_header(request: Request) -> Optional[str]:
+def edge_get_current_user(request: Request) -> EdgeUser:
     auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
-    if auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip()
-    return None
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token tidak valid")
 
-def get_current_user(request: Request) -> EdgeUser:
-    token = read_bearer_from_header(request)
-    if not token:
-        raise HTTPException(401, "Missing bearer token")
+    token = auth.split(" ", 1)[1].strip()
 
-    payload = jwt_verify(token)
-    mid = payload.get("id_masjid") or payload.get("masjid_id")
+    payload = _jwt_like_decode(token)
+
+    mid = payload.get("masjid_id") or payload.get("id_masjid")
     if mid is None:
-        raise HTTPException(401, "Token tidak valid")
+        # token Railway kamu biasanya punya id_masjid
+        raise HTTPException(status_code=401, detail="Token tidak valid")
 
     return EdgeUser(
         id_masjid=int(mid),
@@ -172,19 +185,217 @@ def get_current_user(request: Request) -> EdgeUser:
     )
 
 # ============================================================
-# EDGE KEY guard (header OR query) -> penting utk <img>
+# Optional fallback auth (untuk dev lokal kalau auth.py tidak ada)
 # ============================================================
-def require_edge_key(request: Request):
-    if not EDGE_API_KEY:
-        return
-    k = request.headers.get("x-edge-key") or request.headers.get("X-Edge-Key")
-    if not k:
-        k = request.query_params.get("edge_key")  # ✅ untuk <img>
-    if k != EDGE_API_KEY:
-        raise HTTPException(401, "Invalid edge key")
+FALLBACK_AUTH_ENABLED = env_flag("FALLBACK_AUTH", default=True)
+USING_FALLBACK_AUTH = False
+
+_fallback_users: Dict[str, Dict[str, Any]] = {}
+_fallback_next_masjid_id = 1
+
+def _hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
+async def _read_body_any(request: Request) -> Dict[str, Any]:
+    ct = (request.headers.get("content-type") or "").lower()
+    if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+        form = await request.form()
+        return dict(form)
+    try:
+        return await request.json()
+    except Exception:
+        return {}
+
+def _jwt_like_encode(payload: Dict[str, Any]) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+    sig = hmac.new(JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    sig_b64 = _b64url_encode(sig)
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
 
 # ============================================================
-# ROI file-based
+# ENV / CONFIG
+# ============================================================
+TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
+EDGE_API_KEY = os.getenv("EDGE_API_KEY", "").strip()
+STREAM_TOKEN = os.getenv("STREAM_TOKEN", "").strip()
+
+MISSING_WINDOW = int(os.getenv("MISSING_WINDOW", "24"))
+WARN_THRESHOLD = float(os.getenv("WARN_THRESHOLD", "0.40"))
+ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "0.70"))
+PRESENT_GRACE = int(os.getenv("PRESENT_GRACE", "10"))
+
+YOLO_CONF_DEF = float(os.getenv("YOLO_CONF", "0.50"))
+YOLO_IOU_DEF = float(os.getenv("YOLO_IOU", "0.90"))
+YOLO_IMG_DEF = int(os.getenv("YOLO_IMG", "800"))
+MIN_AREA_RATIO = float(os.getenv("MIN_AREA_RATIO", "0.01"))
+INFER_EVERY = int(os.getenv("INFER_EVERY", "1"))
+
+ROI_STRATEGY = os.getenv("ROI_STRATEGY", "crop").lower()  # crop | full
+CENTER_IN_ROI = os.getenv("CENTER_IN_ROI", "1") == "1"
+REQUIRE_ROI = os.getenv("REQUIRE_ROI", "0") == "1"
+DEBUG_LOG = os.getenv("DEBUG_LOG", "1") == "1"
+
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").strip()
+allow_origins = ["*"] if CORS_ORIGINS == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
+
+# YOLO weights
+DEFAULT_WEIGHT = BASE_DIR / "best.pt"
+ALT_WEIGHT = BASE_DIR / "runs" / "detect" / "train_box" / "weights" / "best.pt"
+if (not DEFAULT_WEIGHT.is_file()) and ALT_WEIGHT.is_file():
+    DEFAULT_WEIGHT = ALT_WEIGHT
+YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", str(DEFAULT_WEIGHT))
+
+TARGET_CLASS_IDS = {int(s) for s in os.getenv("TARGET_CLASS_IDS", "").split(",") if s.strip().isdigit()}
+TARGET_LABELS = {s.strip().lower() for s in os.getenv("TARGET_LABELS", "").split(",") if s.strip()}
+
+LABEL_DISPLAY = {
+    "box": "Kotak Infaq",
+    "donation_box": "Kotak Amal",
+}
+
+# ============================================================
+# FastAPI
+# ============================================================
+app = FastAPI(docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# include auth router if exists (Railway)
+if auth_router is not None:
+    app.include_router(auth_router)
+
+# if no auth router and fallback enabled, provide minimal /auth
+if auth_router is None and FALLBACK_AUTH_ENABLED:
+    from fastapi import APIRouter
+    fallback_router = APIRouter(prefix="/auth", tags=["auth"])
+    USING_FALLBACK_AUTH = True
+
+    @fallback_router.post("/register-masjid")
+    async def register_masjid(request: Request):
+        global _fallback_next_masjid_id
+        body = await _read_body_any(request)
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "").strip()
+        if not username or not password:
+            raise HTTPException(400, "username dan password wajib diisi")
+        if username in _fallback_users:
+            raise HTTPException(409, "username sudah terdaftar")
+
+        masjid_name = str(body.get("nama_masjid") or body.get("masjid_name") or "Masjid Demo").strip()
+
+        u = {
+            "username": username,
+            "pw_hash": _hash_pw(password),
+            "role": "admin_masjid",
+            "id_masjid": _fallback_next_masjid_id,
+            "masjid_name": masjid_name,
+        }
+        _fallback_users[username] = u
+        _fallback_next_masjid_id += 1
+
+        payload = {
+            "username": u["username"],
+            "role": u["role"],
+            "id_masjid": u["id_masjid"],
+            "masjid_name": u["masjid_name"],
+            "exp": int(time.time()) + JWT_EXPIRE_SECONDS,
+        }
+        token = _jwt_like_encode(payload)
+        return {"ok": True, "access_token": token, "token_type": "bearer", "user": payload}
+
+    @fallback_router.post("/login")
+    async def login(request: Request):
+        body = await _read_body_any(request)
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "").strip()
+        if not username or not password:
+            raise HTTPException(400, "username dan password wajib diisi")
+
+        u = _fallback_users.get(username)
+        if not u or u["pw_hash"] != _hash_pw(password):
+            raise HTTPException(401, "username/password salah")
+
+        payload = {
+            "username": u["username"],
+            "role": u["role"],
+            "id_masjid": u["id_masjid"],
+            "masjid_name": u.get("masjid_name"),
+            "exp": int(time.time()) + JWT_EXPIRE_SECONDS,
+        }
+        token = _jwt_like_encode(payload)
+        return {"access_token": token, "token_type": "bearer", "user": payload}
+
+    app.include_router(fallback_router)
+
+# ============================================================
+# Debug
+# ============================================================
+@app.get("/debug/bootstrap")
+def debug_bootstrap():
+    routes = []
+    for r in app.routes:
+        p = getattr(r, "path", None)
+        if p:
+            routes.append(p)
+
+    return {
+        "is_railway": IS_RAILWAY,
+        "computed_enable_capture": ENABLE_CAPTURE,
+        "computed_enable_yolo": ENABLE_YOLO,
+        "dotenv_error": DOTENV_ERROR,
+        "db_import_error": DB_IMPORT_ERROR,
+        "auth_import_error": AUTH_IMPORT_ERROR,
+        "cv2_import_error": CV2_IMPORT_ERROR,
+        "numpy_import_error": NP_IMPORT_ERROR,
+        "ultralytics_import_error": YOLO_IMPORT_ERROR,
+        "using_fallback_auth": USING_FALLBACK_AUTH,
+        "db_available": bool(get_db),
+        "auth_router_loaded": bool(auth_router),
+        "sample_routes": routes[:60],
+    }
+
+@app.get("/debug/jwt")
+def debug_jwt():
+    env_val = (os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "").strip()
+    used_val = JWT_SECRET  # yang dipakai beneran
+
+    def sha8(s: str):
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:8] if s else None
+
+    return {
+        "env_present": bool(env_val),
+        "env_sha256_8": sha8(env_val),
+        "used_sha256_8": sha8(used_val),
+        "using_dev_fallback": used_val == "dev-secret-change-me",
+        "is_railway": IS_RAILWAY,
+    }
+
+
+# ============================================================
+# Edge Key Guard
+# ============================================================
+def require_edge_key(request: Request):
+    """
+    Kalau EDGE_API_KEY di-set, semua request ke endpoint edge harus bawa header:
+    X-Edge-Key: <EDGE_API_KEY>
+    """
+    if not EDGE_API_KEY:
+        return
+    k = request.headers.get("x-edge-key") or request.headers.get("X-Edge-Key") or ""
+    if k != EDGE_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid edge key")
+
+# ============================================================
+# ROI (file-based)
 # ============================================================
 class ROISchema(BaseModel):
     x: confloat(ge=0.0, le=1.0)
@@ -194,25 +405,30 @@ class ROISchema(BaseModel):
 
 ROI_PATH = BASE_DIR / "roi_config.json"
 
-def load_roi() -> Optional[ROISchema]:
+def load_roi_rel() -> Optional[ROISchema]:
     if not ROI_PATH.exists():
         return None
     try:
-        raw = ROI_PATH.read_text("utf-8").strip()
-        if not raw:
+        text = ROI_PATH.read_text(encoding="utf-8").strip()
+        if not text:
             return None
-        return ROISchema(**json.loads(raw))
-    except Exception:
+        return ROISchema(**json.loads(text))
+    except Exception as e:
+        print("[ROI] load error:", repr(e))
         return None
 
-def save_roi(roi: ROISchema) -> None:
-    ROI_PATH.write_text(roi.model_dump_json(), encoding="utf-8")
+def save_roi_rel(roi: ROISchema) -> None:
+    try:
+        ROI_PATH.write_text(roi.model_dump_json(), encoding="utf-8")
+    except Exception:
+        # pydantic v1 fallback
+        ROI_PATH.write_text(roi.json(), encoding="utf-8")
 
-def clamp(v: int, lo: int, hi: int) -> int:
+def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def roi_rect_px(frame_shape) -> Optional[Tuple[int, int, int, int]]:
-    roi = load_roi()
+    roi = load_roi_rel()
     if not roi:
         return None
     H, W = frame_shape[:2]
@@ -224,51 +440,128 @@ def roi_rect_px(frame_shape) -> Optional[Tuple[int, int, int, int]]:
         return None
     return (x1, y1, x2, y2)
 
-@app.get("/roi")
-def api_get_roi(request: Request):
-    require_edge_key(request)
-    return {"roi": load_roi()}
+class ROIResponse(BaseModel):
+    roi: Optional[ROISchema] = None
 
-@app.post("/roi")
-def api_set_roi(request: Request, roi: ROISchema):
+@app.get("/roi", response_model=ROIResponse)
+def get_roi(request: Request):
+    require_edge_key(request)
+    return ROIResponse(roi=load_roi_rel())
+
+@app.post("/roi", response_model=ROIResponse)
+def set_roi(request: Request, roi: ROISchema):
     require_edge_key(request)
     if roi.w <= 0 or roi.h <= 0:
         raise HTTPException(400, "w/h harus > 0")
     if roi.x + roi.w > 1 or roi.y + roi.h > 1:
-        raise HTTPException(400, "ROI keluar frame")
-    save_roi(roi)
-    return {"roi": roi}
+        raise HTTPException(400, "ROI keluar dari frame")
+    save_roi_rel(roi)
+    return ROIResponse(roi=roi)
 
 @app.delete("/roi")
-def api_clear_roi(request: Request):
+def clear_roi(request: Request):
     require_edge_key(request)
     try:
         ROI_PATH.unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        print("[ROI] delete error:", repr(e))
     return {"ok": True}
 
 # ============================================================
-# Telegram helpers (optional)
+# Telegram
 # ============================================================
-_last_tg_ts: Dict[int, float] = {}
+def tg_send_text(chat_id: str, text: str):
+    if not TG_TOKEN or not chat_id:
+        return {"ok": False, "reason": "token/chat_id kosong"}
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=20)
+    if r.status_code != 200:
+        print("[TG] sendMessage ERROR", r.status_code, r.text)
+        return {"ok": False, "status": r.status_code, "text": r.text}
+    return {"ok": True}
 
 def tg_send_photo(chat_id: str, jpg_bytes: bytes, caption: str):
     if not TG_TOKEN or not chat_id:
-        return
+        return {"ok": False, "reason": "token/chat_id kosong"}
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
     files = {"photo": ("capture.jpg", jpg_bytes, "image/jpeg")}
     data = {"chat_id": chat_id, "caption": caption}
+    r = requests.post(url, data=data, files=files, timeout=20)
+    if r.status_code != 200:
+        print("[TG] sendPhoto ERROR", r.status_code, r.text)
+        return {"ok": False, "status": r.status_code, "text": r.text}
+    return {"ok": True}
+
+# ============================================================
+# DB Helpers
+# ============================================================
+def _open_thread_db_session():
+    if get_db is None:
+        return None, None
+    gen = get_db()
+    db = next(gen)
+    return db, gen
+
+def _close_thread_db_session(gen):
     try:
-        requests.post(url, data=data, files=files, timeout=20)
+        if gen:
+            gen.close()
     except Exception:
         pass
 
+def get_latest_camera_for_masjid(db: Session, masjid_id: int):
+    if db is None:
+        return None
+    return (
+        db.query(Camera)
+        .filter(Camera.id_masjid == masjid_id, Camera.status == "aktif")
+        .order_by(Camera.id_camera.desc())
+        .first()
+    )
+
+def get_tg_target_by_masjid_id(db: Session, masjid_id: int):
+    if db is None:
+        return None
+    m = db.query(Masjid).filter(Masjid.id_masjid == masjid_id).first()
+    if not m:
+        return None
+    chat_id = (str(m.tg_chat_id).strip() if m.tg_chat_id is not None else "")
+    if not chat_id:
+        return None
+    cooldown = int(m.tg_cooldown) if m.tg_cooldown is not None else 10
+    return {"id_masjid": int(m.id_masjid), "chat_id": chat_id, "cooldown": cooldown}
+
+last_alert_ts_by_masjid: Dict[int, float] = {}
+
+def maybe_send_alert_photo(db: Session, masjid_id: Optional[int], frame):
+    if cv2 is None or masjid_id is None:
+        return
+    target = get_tg_target_by_masjid_id(db, masjid_id)
+    if not target:
+        return
+
+    mid = target["id_masjid"]
+    chat_id = target["chat_id"]
+    cooldown = target["cooldown"]
+
+    now = time.time()
+    last_ts = last_alert_ts_by_masjid.get(mid, 0.0)
+    if cooldown > 0 and (now - last_ts) < cooldown:
+        return
+
+    ok_jpg, jpg_buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok_jpg:
+        return
+
+    res = tg_send_photo(chat_id, jpg_buf.tobytes(), "⚠️ ALERT: Kotak infaq tidak terdeteksi!")
+    if res.get("ok"):
+        last_alert_ts_by_masjid[mid] = now
+
 # ============================================================
-# YOLO lazy init (optional)
+# YOLO (lazy init)
 # ============================================================
 _yolo_model = None
-_yolo_names = None
+_model_names = None
 
 def matches_target(cls_id: int, label: str) -> bool:
     if TARGET_CLASS_IDS:
@@ -277,12 +570,12 @@ def matches_target(cls_id: int, label: str) -> bool:
         return (label or "").lower() in TARGET_LABELS
     return True
 
-def ensure_yolo():
-    global _yolo_model, _yolo_names
+def ensure_model():
+    global _yolo_model, _model_names
     if not ENABLE_YOLO:
         return
     if YOLO is None:
-        raise RuntimeError(f"ultralytics belum ada: {YOLO_ERR}")
+        raise RuntimeError(f"ultralytics belum terpasang: {YOLO_IMPORT_ERROR}")
     if _yolo_model is not None:
         return
 
@@ -295,84 +588,119 @@ def ensure_yolo():
         _yolo_model.to("cpu")
     except Exception:
         pass
-    _yolo_names = getattr(_yolo_model, "names", None)
+    _model_names = getattr(_yolo_model, "names", None)
+    print("[YOLO] loaded:", wp)
 
-def infer_boxes(frame, counter: int, roi_rect: Optional[Tuple[int, int, int, int]]):
+def infer_and_draw(frame, counter: int, roi_rect):
     if not ENABLE_YOLO or _yolo_model is None:
         return []
     if counter % INFER_EVERY != 0:
         return []
 
     H, W = frame.shape[:2]
-    crop_mode = roi_rect is not None
-    if crop_mode:
-        x1, y1, x2, y2 = roi_rect
-        src = frame[y1:y2, x1:x2]
-    else:
-        x1 = y1 = 0
-        src = frame
+    use_crop = (roi_rect is not None) and (ROI_STRATEGY == "crop")
 
-    res = _yolo_model.predict(
-        source=src, imgsz=YOLO_IMG, conf=YOLO_CONF, iou=YOLO_IOU,
-        max_det=50, device="cpu", verbose=False
-    )[0]
+    if use_crop:
+        rx1, ry1, rx2, ry2 = roi_rect
+        crop = frame[ry1:ry2, rx1:rx2]
+        base_area = max(1, (ry2 - ry1) * (rx2 - rx1))
+        res = _yolo_model.predict(
+            source=crop, imgsz=YOLO_IMG_DEF, conf=YOLO_CONF_DEF, iou=YOLO_IOU_DEF,
+            max_det=50, device="cpu", verbose=False
+        )[0]
+    else:
+        base_area = max(1, H * W)
+        res = _yolo_model.predict(
+            source=frame, imgsz=YOLO_IMG_DEF, conf=YOLO_CONF_DEF, iou=YOLO_IOU_DEF,
+            max_det=50, device="cpu", verbose=False
+        )[0]
 
     dets = []
     if getattr(res, "boxes", None) is None:
         return dets
 
+    if roi_rect:
+        rx1, ry1, rx2, ry2 = roi_rect
+
     for b in res.boxes:
-        conf = float(b.conf[0])
-        bx1, by1, bx2, by2 = [int(v) for v in b.xyxy[0]]
+        conf_b = float(b.conf[0])
+        x1, y1, x2, y2 = [int(v) for v in b.xyxy[0]]
         cls_id = int(b.cls[0]) if b.cls is not None else -1
 
-        if crop_mode:
-            bx1 += x1; bx2 += x1
-            by1 += y1; by2 += y1
+        if use_crop and roi_rect:
+            x1 += rx1; x2 += rx1
+            y1 += ry1; y2 += ry1
 
-        if isinstance(_yolo_names, dict):
-            label = _yolo_names.get(cls_id, "obj")
-        elif isinstance(_yolo_names, (list, tuple)) and 0 <= cls_id < len(_yolo_names):
-            label = str(_yolo_names[cls_id])
+        if isinstance(_model_names, dict):
+            label = _model_names.get(cls_id, "obj")
+        elif isinstance(_model_names, (list, tuple)) and 0 <= cls_id < len(_model_names):
+            label = str(_model_names[cls_id])
         else:
             label = "obj"
 
         if not matches_target(cls_id, label):
             continue
 
-        dets.append((bx1, by1, bx2, by2, conf, cls_id, label))
+        area = max(1, (x2 - x1) * (y2 - y1))
+        if (area / base_area) < MIN_AREA_RATIO:
+            continue
+
+        if roi_rect and CENTER_IN_ROI:
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            if not (rx1 <= cx <= rx2 and ry1 <= cy <= ry2):
+                continue
+
+        dets.append((x1, y1, x2, y2, conf_b, cls_id, label))
+
+    for (x1, y1, x2, y2, conf_b, cls_id, label) in dets[:50]:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 0), 2)
+        show = LABEL_DISPLAY.get(label.lower(), label)
+        cv2.putText(frame, f"{show} {conf_b:.2f}", (x1, max(12, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 0), 2, cv2.LINE_AA)
+
+    if DEBUG_LOG and counter % 30 == 0:
+        print(f"[DEBUG] dets kept={len(dets)}")
     return dets
 
 # ============================================================
-# Global stream state
+# Global state (stream)
 # ============================================================
-running = False
-cap = None
-lock = threading.Lock()
+cap: Optional[Any] = None
+running: bool = False
 latest_jpeg: Optional[bytes] = None
-last_frame_ts: float = 0.0
-last_cap_error: Optional[str] = None
-stream_ready: bool = False
-alert_status: str = "present"
+lock = threading.Lock()
 
-CUR_SOURCE = "webcam"   # webcam | video | ipcam
-CUR_INDEX = 0
+alert_status: str = "present"
+stream_ready = False
+last_frame_ts = 0.0
+last_cap_error = None
+
+CUR_SOURCE: str = "webcam"
+CUR_INDEX: int = 0
 CUR_PATH: Optional[str] = None
-CUR_LOOP = True
+CUR_LOOP: bool = False
+
+CUR_CAMERA_ID: Optional[int] = None
 CUR_MASJID_ID: Optional[int] = None
 
-def open_capture(source: str, index: int, path: Optional[str]):
+# ============================================================
+# Open source + reconnect
+# ============================================================
+def open_source(source: str, index: int, path: Optional[str]):
     if cv2 is None:
-        raise RuntimeError("OpenCV belum terpasang")
+        raise RuntimeError("OpenCV belum terpasang.")
+
     if source == "webcam":
         return cv2.VideoCapture(index)
+
     if not path:
-        raise ValueError("path kosong")
+        raise ValueError("path video/url kosong")
     return cv2.VideoCapture(path)
 
 def reopen_capture(source: str, index: int, path: Optional[str], sleep_s: float = 1.0):
     try:
-        c = open_capture(source, index, path)
+        c = open_source(source, index, path)
         if c is None or not c.isOpened():
             try:
                 if c:
@@ -386,191 +714,169 @@ def reopen_capture(source: str, index: int, path: Optional[str], sleep_s: float 
         time.sleep(sleep_s)
         return None
 
-def capture_worker(source: str, index: int, path: Optional[str], loop_video: bool, masjid_id: Optional[int]):
-    global cap, running, latest_jpeg, last_frame_ts, last_cap_error, stream_ready, alert_status
+# ============================================================
+# Capture loop (thread)
+# ============================================================
+def capture_loop(source: str, index: int, path: Optional[str], loop_video: bool,
+                 camera_id: Optional[int], masjid_id: Optional[int]):
+
+    global cap, running, latest_jpeg, alert_status, stream_ready, last_frame_ts, last_cap_error
 
     stream_ready = False
     last_frame_ts = 0.0
     last_cap_error = None
-    alert_status = "present"
 
     if not ENABLE_CAPTURE:
         running = False
         last_cap_error = "Capture disabled (ENABLE_CAPTURE=false)"
         return
+
     if cv2 is None or np is None:
         running = False
         last_cap_error = "cv2/numpy tidak tersedia"
         return
 
+    db, gen = _open_thread_db_session()
     try:
-        ensure_yolo()
-    except Exception as e:
-        if ENABLE_YOLO:
-            running = False
-            last_cap_error = f"YOLO init gagal: {repr(e)}"
-            return
-
-    cap = reopen_capture(source, index, path, sleep_s=1.0)
-    if cap is None:
-        running = False
-        last_cap_error = "Gagal membuka capture"
-        return
-
-    # coba baca frame pertama
-    ok0, frame0 = cap.read()
-    if not ok0:
         try:
-            cap.release()
-        except Exception:
-            pass
+            ensure_model()
+        except Exception as e:
+            if ENABLE_YOLO:
+                running = False
+                last_cap_error = f"YOLO init gagal: {repr(e)}"
+                return
+
         cap = reopen_capture(source, index, path, sleep_s=1.0)
         if cap is None:
             running = False
-            last_cap_error = "Gagal membuka capture setelah retry"
+            last_cap_error = "Gagal membuka kamera/capture"
             return
 
-    absent_hist: List[int] = []
-    missing_streak = 0
-    counter = 0
-    fail_read_streak = 0
-    roi_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
-    roi = roi_rect_px(frame0.shape)
+        ok0, frame0 = cap.read()
+        if not ok0:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            cap = reopen_capture(source, index, path, sleep_s=1.0)
+            if cap is None:
+                running = False
+                last_cap_error = "Gagal membuka kamera/capture setelah retry"
+                return
+            ok0, frame0 = cap.read()
+            if not ok0:
+                running = False
+                last_cap_error = "Tidak bisa membaca frame pertama"
+                return
 
-    while running:
-        ok, frame = cap.read()
-        if not ok:
-            fail_read_streak += 1
+        roi = roi_rect_px(frame0.shape)
+        absent_hist: List[int] = []
+        missing_streak = 0
+        counter = 0
+        roi_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
+        fail_read_streak = 0
 
-            # looping video
-            if source == "video" and loop_video and fail_read_streak >= 2:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                fail_read_streak = 0
+        while running:
+            ok, frame = cap.read()
+            if not ok:
+                fail_read_streak += 1
+
+                if source == "video" and loop_video and fail_read_streak >= 2:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    fail_read_streak = 0
+                    time.sleep(0.02)
+                    continue
+
+                if fail_read_streak >= 15:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    cap = reopen_capture(source, index, path, sleep_s=1.0)
+                    fail_read_streak = 0
+                    if cap is None:
+                        last_cap_error = "Reconnect gagal"
+                        time.sleep(0.2)
+                        continue
+
                 time.sleep(0.02)
                 continue
 
-            # reconnect
-            if fail_read_streak >= 15:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-                cap = reopen_capture(source, index, path, sleep_s=1.0)
-                fail_read_streak = 0
-                if cap is None:
-                    last_cap_error = "Reconnect gagal"
-                    time.sleep(0.2)
-                    continue
+            fail_read_streak = 0
+            counter += 1
 
-            time.sleep(0.02)
-            continue
+            if counter % 30 == 0:
+                new_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
+                if new_mtime != roi_mtime:
+                    roi_mtime = new_mtime
+                    roi = roi_rect_px(frame.shape)
 
-        fail_read_streak = 0
-        counter += 1
+            dets = []
+            if ENABLE_YOLO and _yolo_model is not None:
+                dets = infer_and_draw(frame, counter, roi) or []
 
-        # reload ROI jika berubah
-        if counter % 30 == 0:
-            new_mtime = ROI_PATH.stat().st_mtime if ROI_PATH.exists() else 0.0
-            if new_mtime != roi_mtime:
-                roi_mtime = new_mtime
-                roi = roi_rect_px(frame.shape)
+            if REQUIRE_ROI and roi is None:
+                dets = []
 
-        dets = infer_boxes(frame, counter, roi) if (ENABLE_YOLO and _yolo_model is not None) else []
-        present_raw = (len(dets) > 0) if ENABLE_YOLO else True
+            present_raw = (len(dets) > 0) if ENABLE_YOLO else True
+            missing_streak = 0 if present_raw else (missing_streak + 1)
+            present = True if present_raw or missing_streak <= PRESENT_GRACE else False
 
-        missing_streak = 0 if present_raw else (missing_streak + 1)
-        present = True if present_raw or missing_streak <= PRESENT_GRACE else False
+            absent_hist.append(0 if present else 1)
+            if len(absent_hist) > MISSING_WINDOW:
+                absent_hist.pop(0)
 
-        absent_hist.append(0 if present else 1)
-        if len(absent_hist) > MISSING_WINDOW:
-            absent_hist.pop(0)
+            avg_absent = float(np.mean(absent_hist)) if absent_hist else (0.0 if present else 1.0)
 
-        avg_absent = float(np.mean(absent_hist)) if absent_hist else (0.0 if present else 1.0)
-        if avg_absent >= ALERT_THRESHOLD:
-            alert_status = "missing"
-        else:
-            alert_status = "present"
+            status_str = "NORMAL"
+            if avg_absent >= ALERT_THRESHOLD:
+                status_str = "ALERT"
+            elif avg_absent >= WARN_THRESHOLD:
+                status_str = "WARN"
 
-        # draw ROI box
-        if roi:
-            x1, y1, x2, y2 = roi
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 165, 0), 2)
+            old_alert = alert_status
+            alert_status = "missing" if status_str == "ALERT" else "present"
 
-        # draw detections
-        for (x1, y1, x2, y2, conf, cls_id, label) in dets[:50]:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 215, 0), 2)
-            cv2.putText(frame, f"{label} {conf:.2f}", (x1, max(12, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 0), 2, cv2.LINE_AA)
+            if TG_TOKEN and status_str == "ALERT":
+                print("[ALERT] sending TG. masjid_id=", masjid_id)
+                maybe_send_alert_photo(db, masjid_id, frame)
 
-        ok2, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        if ok2:
-            with lock:
-                latest_jpeg = jpg.tobytes()
-                stream_ready = True
-                last_frame_ts = time.time()
-                last_cap_error = None
+            if roi:
+                cv2.rectangle(frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 165, 0), 2)
 
-        time.sleep(0.01)
+            ok2, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if ok2:
+                with lock:
+                    latest_jpeg = jpg.tobytes()
+                    stream_ready = True
+                    last_frame_ts = time.time()
+                    last_cap_error = None
 
-    try:
-        if cap:
-            cap.release()
-    except Exception:
-        pass
+            time.sleep(0.01)
 
-def mjpeg_gen_wait():
+    finally:
+        try:
+            if cap:
+                cap.release()
+        except Exception:
+            pass
+        stream_ready = False
+        _close_thread_db_session(gen)
+
+# ============================================================
+# MJPEG stream
+# ============================================================
+def mjpeg_gen():
     boundary = "frame"
     while True:
         with lock:
             buf = latest_jpeg
-            is_running = running
-
-        if not is_running:
-            # kalau kamera stop, berhenti streaming
-            time.sleep(0.1)
-            continue
-
         if buf:
             yield (
                 b"--" + boundary.encode() + b"\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Cache-Control: no-store\r\n\r\n" + buf + b"\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buf + b"\r\n"
             )
-        else:
-            # belum ada frame pertama → tunggu (TAPI JANGAN return error)
-            time.sleep(0.05)
-
-# ============================================================
-# Auth untuk stream: token bisa STREAM_TOKEN atau JWT
-# ============================================================
-def stream_auth_ok(request: Request) -> bool:
-    # 1) Edge key (opsional)
-    require_edge_key(request)
-
-    # 2) token dari query/header
-    token = request.query_params.get("token") or read_bearer_from_header(request)
-
-    # kalau STREAM_TOKEN diset -> boleh pakai token random itu
-    if STREAM_TOKEN:
-        if token == STREAM_TOKEN:
-            return True
-        # kalau token ternyata JWT valid, juga kita terima (biar fleksibel)
-        try:
-            if token and token.count(".") == 2:
-                jwt_verify(token)
-                return True
-        except Exception:
-            pass
-        return False
-
-    # kalau STREAM_TOKEN kosong -> wajib JWT valid
-    if not token:
-        return False
-    try:
-        jwt_verify(token)
-        return True
-    except Exception:
-        return False
+        time.sleep(0.02)
 
 # ============================================================
 # Routes
@@ -579,17 +885,17 @@ def stream_auth_ok(request: Request) -> bool:
 def root():
     return {
         "ok": True,
+        "msg": "camera_server up",
         "is_railway": IS_RAILWAY,
         "enable_capture": ENABLE_CAPTURE,
         "enable_yolo": ENABLE_YOLO,
-        "cv2_ok": bool(cv2),
-        "np_ok": bool(np),
-        "yolo_ok": bool(YOLO),
-        "cv2_err": CV2_ERR,
-        "np_err": NP_ERR,
-        "yolo_err": YOLO_ERR,
-        "edge_key_enabled": bool(EDGE_API_KEY),
-        "stream_token_enabled": bool(STREAM_TOKEN),
+        "cv2": bool(cv2),
+        "numpy": bool(np),
+        "ultralytics": bool(YOLO),
+        "token_loaded": bool(TG_TOKEN),
+        "db_available": bool(get_db),
+        "auth_router_loaded": bool(auth_router),
+        "using_fallback_auth": USING_FALLBACK_AUTH,
     }
 
 @app.get("/camera/status")
@@ -601,25 +907,70 @@ def camera_status(request: Request):
         "last_frame_ts": last_frame_ts,
         "last_cap_error": last_cap_error,
         "alert_status": alert_status,
+        "camera_id": CUR_CAMERA_ID,
+        "masjid_id": CUR_MASJID_ID,
         "source": CUR_SOURCE,
         "index": CUR_INDEX,
         "path": CUR_PATH,
         "loop": CUR_LOOP,
-        "masjid_id": CUR_MASJID_ID,
+        "enable_capture": ENABLE_CAPTURE,
+        "enable_yolo": ENABLE_YOLO,
     }
 
-@app.post("/camera/start")
-def camera_start(
+@app.get("/camera/default")
+def camera_default(request: Request):
+    require_edge_key(request)
+    return {
+        "source": CUR_SOURCE or "webcam",
+        "index": CUR_INDEX or 0,
+        "path": CUR_PATH,
+        "loop": CUR_LOOP if CUR_LOOP is not None else True,
+        "camera_id": CUR_CAMERA_ID,
+    }
+
+@app.post("/camera/start-default")
+def start_default(
     request: Request,
-    user: EdgeUser = Depends(get_current_user),
+    current_user: EdgeUser = Depends(edge_get_current_user),
+    db: Session = Depends(DB_DEP),
+):
+    require_edge_key(request)
+
+    if not ENABLE_CAPTURE:
+        raise HTTPException(503, "Capture disabled (cloud mode)")
+    if db is None:
+        raise HTTPException(503, "DB belum tersedia")
+
+    cam = get_latest_camera_for_masjid(db, current_user.id_masjid)
+    if not cam:
+        raise HTTPException(404, "Kamera belum ada di database untuk masjid ini")
+
+    if cam.source_type in ("ipcam", "video") and not cam.source_path:
+        raise HTTPException(400, "Camera source_path kosong")
+
+    return start_camera(
+        request=request,
+        current_user=current_user,
+        source=cam.source_type,
+        index=cam.source_index or 0,
+        path=cam.source_path,
+        loop=True,
+        camera_id=cam.id_camera,
+    )
+
+@app.post("/camera/start")
+def start_camera(
+    request: Request,
+    current_user: EdgeUser = Depends(edge_get_current_user),
     source: str = Query("webcam", pattern="^(webcam|video|ipcam)$"),
     index: int = 0,
     path: Optional[str] = None,
     loop: bool = True,
+    camera_id: Optional[int] = None,
 ):
     require_edge_key(request)
 
-    global running, CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP, CUR_MASJID_ID, latest_jpeg, stream_ready, last_cap_error
+    global running, CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP, CUR_CAMERA_ID, CUR_MASJID_ID, stream_ready, last_cap_error
 
     if not ENABLE_CAPTURE:
         raise HTTPException(503, "Capture disabled (cloud mode)")
@@ -627,29 +978,35 @@ def camera_start(
         raise HTTPException(503, "OpenCV tidak tersedia")
     if running:
         return {"ok": True, "msg": "already running"}
-
     if source in ("video", "ipcam") and not path:
-        raise HTTPException(400, "path wajib untuk video/ipcam")
+        raise HTTPException(400, "path wajib diisi untuk video/ipcam")
 
     CUR_SOURCE, CUR_INDEX, CUR_PATH, CUR_LOOP = source, index, path, loop
-    CUR_MASJID_ID = user.id_masjid
+    CUR_CAMERA_ID = camera_id
+    CUR_MASJID_ID = current_user.id_masjid
 
-    with lock:
-        latest_jpeg = None
     stream_ready = False
     last_cap_error = None
-
+    global alert_status
+    alert_status = "present"
     running = True
     threading.Thread(
-        target=capture_worker,
-        kwargs={"source": source, "index": index, "path": path, "loop_video": loop, "masjid_id": CUR_MASJID_ID},
-        daemon=True
+        target=capture_loop,
+        kwargs={
+            "source": source,
+            "index": index,
+            "path": path,
+            "loop_video": loop,
+            "camera_id": CUR_CAMERA_ID,
+            "masjid_id": CUR_MASJID_ID,
+        },
+        daemon=True,
     ).start()
 
-    return {"ok": True, "masjid_id": CUR_MASJID_ID, "source": CUR_SOURCE}
+    return {"ok": True, "camera_id": CUR_CAMERA_ID, "masjid_id": CUR_MASJID_ID}
 
 @app.post("/camera/stop")
-def camera_stop(request: Request):
+def stop_camera(request: Request):
     require_edge_key(request)
     global running
     running = False
@@ -658,7 +1015,7 @@ def camera_stop(request: Request):
 @app.get(
     "/camera/stream",
     response_class=StreamingResponse,
-    responses={200: {"description": "MJPEG stream"}},
+    responses={200: {"description": "MJPEG stream", "content": {"multipart/x-mixed-replace; boundary=frame": {}}}},
 )
 def camera_stream(token: Optional[str] = Query(None)):
     if STREAM_TOKEN and token != STREAM_TOKEN:
@@ -666,44 +1023,38 @@ def camera_stream(token: Optional[str] = Query(None)):
 
     if not running:
         raise HTTPException(status_code=409, detail="Camera is not running yet")
+    if not stream_ready:
+        raise HTTPException(status_code=425, detail="Stream not ready yet (waiting first frame)")
 
-    # ✅ jangan 425 — biarkan stream nunggu frame pertama
     return StreamingResponse(
-        mjpeg_gen_wait(),
+        mjpeg_gen(),
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )
 
-@app.get("/camera/frame.jpg")
-def camera_frame(request: Request):
-    # snapshot endpoint (fallback, stabil di tunnel)
-    if not stream_auth_ok(request):
-        raise HTTPException(401, "Unauthorized frame")
-    if not running:
-        raise HTTPException(409, "Camera is not running yet")
+@app.get("/debug/tg/me")
+def debug_tg_me(
+    request: Request,
+    current_user: EdgeUser = Depends(edge_get_current_user),
+    db: Session = Depends(DB_DEP),
+):
+    require_edge_key(request)
+    if db is None:
+        return {"ok": False, "msg": "DB belum tersedia"}
+    target = get_tg_target_by_masjid_id(db, current_user.id_masjid)
+    return {"ok": True, "masjid_id": current_user.id_masjid, "target": target, "token_loaded": bool(TG_TOKEN)}
 
-    with lock:
-        buf = latest_jpeg
-
-    # kalau belum ada frame, return 204 (bukan error gambar rusak)
-    if not buf:
-        return Response(status_code=204)
-
-    return Response(content=buf, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
-
-@app.get("/debug/stream-auth")
-def debug_stream_auth(request: Request):
-    # bantu cek kenapa stream 401
-    token_q = request.query_params.get("token")
-    ek_q = request.query_params.get("edge_key")
-    auth_h = bool(read_bearer_from_header(request))
-    ek_h = bool(request.headers.get("x-edge-key") or request.headers.get("X-Edge-Key"))
-    return {
-        "edge_key_enabled": bool(EDGE_API_KEY),
-        "stream_token_enabled": bool(STREAM_TOKEN),
-        "has_token_query": bool(token_q),
-        "has_edge_key_query": bool(ek_q),
-        "has_bearer_header": auth_h,
-        "has_edge_key_header": ek_h,
-        "stream_auth_ok": stream_auth_ok(request),
-    }
+@app.post("/debug/tg/test")
+def debug_tg_test(
+    request: Request,
+    current_user: EdgeUser = Depends(edge_get_current_user),
+    db: Session = Depends(DB_DEP),
+):
+    require_edge_key(request)
+    if db is None:
+        return {"ok": False, "msg": "DB belum tersedia"}
+    target = get_tg_target_by_masjid_id(db, current_user.id_masjid)
+    if not target:
+        return {"ok": False, "msg": "tg_chat_id kosong / masjid tidak ditemukan"}
+    res = tg_send_text(target["chat_id"], f"✅ TEST NOTIF untuk masjid_id={target['id_masjid']}")
+    return {"ok": True, "target": target, "send_result": res}
